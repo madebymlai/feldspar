@@ -1,0 +1,46 @@
+[feldspar]
+db_path = "feldspar.db"
+model_path = "feldspar.model"
+recap_every = 3
+
+[trace_review]
+api_key_env = "OPENROUTER_API_KEY"
+model = "openai/gpt-oss-20b:nitro"
+
+[thresholds]
+confidence_gap = 25
+over_analysis_multiplier = 1.5
+overthinking_multiplier = 2.0
+
+[budgets]
+minimal = [2, 3]
+standard = [3, 5]
+deep = [5, 8]
+
+[pruning]
+no_outcome_days = 30
+low_quality_days = 15
+with_outcome_days = 90
+
+[modes.architecture]
+requires = ["components"]
+budget = "deep"
+
+[modes.performance]
+requires = ["latency"]
+budget = "standard"
+
+[modes.debugging]
+requires = ["evidence"]
+budget = "standard"
+
+[modes.scaling]
+requires = ["components", "throughput"]
+budget = "deep"
+
+[modes.security]
+requires = ["evidence"]
+budget = "deep"
+
+[components]
+valid = []  # populate per project

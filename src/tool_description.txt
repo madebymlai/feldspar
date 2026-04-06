@@ -1,0 +1,37 @@
+A cognitive reasoning tool for dynamic, reflective problem-solving through structured thoughts.
+
+This tool helps analyze problems through sequential thinking with built-in quality guards. Each thought is independently analyzed for cognitive biases, overconfidence, sycophancy, and depth. The tool actively pushes back when reasoning is shallow, biased, or overconfident.
+
+When to use this tool:
+- Breaking down complex problems into steps
+- Architecture and design decisions
+- Performance analysis requiring quantified estimates
+- Debugging that needs evidence-based reasoning
+- Any problem where the full scope isn't clear initially
+
+Key features:
+- Adjust totalThoughts up or down as you progress
+- Revise previous thoughts when you realize they were wrong
+- Branch into alternative approaches (kills tunnel vision)
+- Receive real-time warnings: ANTI-QUICK-FIX, OVERCONFIDENCE, UNDERTHINKING, OVERTHINKING
+- Confidence is independently calibrated -- back claims with evidence
+- Every 3rd thought includes an auto-recap to prevent context drift
+- On completion, generates an ADR skeleton
+
+Thinking modes (each triggers domain-specific validation):
+- architecture: Must name affectedComponents. Warns if no impact estimate.
+- performance: Must include estimatedImpact with latency. Warns if no numbers cited.
+- debugging: Must include evidence (file paths, logs, stack traces). Warns if guessing.
+- scaling: Must estimate throughput impact. Warns if no capacity numbers.
+- security: Must cite threat model or vulnerability class. Warns if hand-waving.
+
+You should:
+1. Start with an initial estimate of needed thoughts, but be ready to adjust
+2. Set thinkingMode to get domain-specific validation
+3. Name affectedComponents from the real system (don't hallucinate)
+4. Report confidence honestly -- the calibrator will flag overconfidence
+5. Cite evidence (file paths, measurements, docs) to earn confidence points
+6. Branch when you catch yourself committing to the first idea without exploring alternatives
+7. Revise previous thoughts when you realize they were wrong
+8. Express uncertainty when present -- false confidence is worse than honest doubt
+9. Only set nextThoughtNeeded to false when truly done and a satisfactory answer is reached
