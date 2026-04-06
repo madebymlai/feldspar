@@ -98,23 +98,34 @@ struct ThoughtRecord {
 
 ### Thinking Modes (runtime-configured, not compile-time enum)
 
-Modes defined in config, each specifies required fields, budget tier, and warning rules:
+Modes defined in config, each specifies required fields, budget tier, and what feldspar watches for.
+New mode = add a block to config. No recompile.
+
+### Orchestrator Model
+
+Each Valence skill gets its own teammate with a specific thinking mode. The main session
+runs as orchestrator -- it delegates, doesn't solve. One global PerpetualBooster model
+with thinking_mode as a feature column (learns cross-mode patterns).
+
+| Skill | Thinking Mode | What feldspar watches for |
+|---|---|---|
+| `/arm` | `brainstorm` | Must extract requirements not solutions, must probe gaps, must not jump to how |
+| `/arch` | `architecture` | Must name components, must estimate impact, must explore alternatives |
+| `/solve` | `problem-solving` | Must cite evidence, must explore alternatives, must not assume root cause |
+| `/breakdown` | `planning` | Must cover all components from arch, must scope tasks atomically |
+| `/bugfest` | `debugging` | Must cite file paths/logs/stack traces, must verify claims |
+| `/build` | `implementation` | Must stay focused on task scope, must not redesign, must not overthink |
+| `/pmatch` | `pattern-matching` | Must cite specific claims from source, must verify each against target |
+| main session | `orchestrator` | Must delegate not solve, must not go past 2-3 thoughts without spawning specialist |
+
+### Mode Config Format
 
 ```toml
 [modes.architecture]
 requires = ["components"]
 budget = "deep"
-
-[modes.debugging]
-requires = ["evidence"]
-budget = "standard"
-
-[modes.code-review]
-requires = ["evidence", "components"]
-budget = "standard"
+watches = "Must name components, must estimate impact, must explore alternatives"
 ```
-
-New mode = add a block to config. No recompile. Agents can use custom modes.
 
 ---
 
@@ -275,6 +286,46 @@ budget_ratio: f64                // thought_number / budget.max
 - Called every thought
 - Flags data drift (types of traces changing) and concept drift (strategies failing)
 - Built into PerpetualBooster
+
+### Pattern Recall (on thought 1)
+
+On thought 1, ML finds similar past traces and surfaces context + optional warning.
+
+1. ML finds similar traces by learned feature similarity
+2. DB retrieves their details (mode, branch count, trust score, AR scores)
+3. Rust code formats into readable string
+
+```json
+// Thought 1 response includes:
+{
+  "patternRecall": "Similar architecture+auth-service traces: branching early (avg trust 7.8), no branching (avg trust 3.2)",
+  "warnings": [
+    "PATTERN_RISK: Current trace has no branch yet. Similar unbranched traces scored poorly."
+  ]
+}
+```
+
+- Pattern recall = neutral context, shown on thought 1 always (if similar traces exist)
+- PATTERN_RISK warning = only when ML recognizes a failing pattern
+- No external model needed. DB query + string formatting.
+
+### Full AR Feedback
+
+Full AR reviews each skill's output (design docs, code, solutions). AR score feeds back
+to the traces that produced that output as additional feature columns.
+
+```
+trust_score: f64,            // from trace review (per trace, on completion)
+ar_critical: Option<u32>,    // from full AR (per task output, may be null)
+ar_recommended: Option<u32>,
+ar_noted: Option<u32>,
+ar_score: Option<f64>,       // overall AR score
+```
+
+PerpetualBooster handles nulls natively. Traces with AR data get richer training.
+Traces without it still train on trust score alone.
+
+One global PerpetualBooster model with thinking_mode as feature column.
 
 ### Train
 - Called on trace completion + when late signals arrive (AR score)
@@ -643,3 +694,79 @@ and microsecond-fast. Everything else is fire-and-forget async.
 5. Close DB
 6. Exit
 ```
+
+---
+
+## Principles (config/principles.yaml)
+
+YAML file with toggleable principle groups. Base groups ship with feldspar.
+Project-specific groups added via installer or manually.
+
+Base groups:
+- `solid` (active by default) -- SRP, OCP, LSP, ISP, DIP
+- `kiss-dry` (active by default) -- KISS, DRY
+- `no-defensive-garbage` (active by default) -- no fallbacks, trust contracts
+- `composition` (active by default) -- composition over inheritance, invalid states, tell don't ask
+- `tdd` (inactive by default) -- test-driven development
+- `security` (inactive by default) -- input validation, secrets management
+
+Each principle has: name, rule, and verification questions (ask).
+Active principles loaded at startup, injected into session context.
+Analyzers can reference them (e.g. tdd active + no tests = warning).
+
+---
+
+## Install Experience
+
+Target: anyone with Claude Code, no Rust knowledge needed.
+
+### Distribution
+- npm package wrapping platform-specific binary
+- `npm install -g feldspar` or `npx feldspar`
+
+### Install Flow
+
+```
+$ feldspar init
+
+✓ Created config/feldspar.toml (8 base thinking modes)
+✓ Created config/principles.yaml (6 principle groups)
+✓ Added MCP entry to .mcp.json
+✓ Installed SessionStart hook
+✓ Configured tmux + mouse support (skipped on Windows)
+
+? Any custom thinking modes? (or skip)
+  >
+
+? Which principle groups to activate? (space to select)
+  ❯ ◉ solid
+    ◉ kiss-dry
+    ◉ no-defensive-garbage
+    ◉ composition
+    ◯ tdd
+    ◯ security
+
+? Any project-specific principles? (or skip)
+  >
+
+? OpenRouter API key for trace review? (or skip)
+  > sk-or-...
+
+✓ Config saved. Run 'claude' to start.
+```
+
+### Auto-start Daemon
+
+SessionStart hook checks if feldspar is running, starts it if not:
+
+```bash
+if ! curl -s http://localhost:3581/health > /dev/null 2>&1; then
+  feldspar start --daemon &
+fi
+```
+
+### Components Auto-Discovery
+
+No manual component list needed at install. Feldspar reads codebase structure
+(Cargo.toml workspaces, package.json workspaces, directory names) and auto-populates.
+Built as a feature, not an install step.

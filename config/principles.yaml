@@ -1,0 +1,119 @@
+# Feldspar Coding Principles
+# Groups can be activated/deactivated. Base groups ship with feldspar.
+# Project-specific groups added via installer or manually.
+
+groups:
+
+  # --- Base groups (ship with feldspar) ---
+
+  solid:
+    active: true
+    principles:
+      - name: Single Responsibility (SRP)
+        rule: One module, one reason to change
+        ask:
+          - "Can I describe this module's purpose without using 'and'?"
+          - "What is the single reason this module would need to change?"
+      - name: Open/Closed (OCP)
+        rule: Extend behavior without modifying existing code
+        ask:
+          - "Can I add this behavior without changing existing code?"
+          - "Am I editing a switch/if-else chain to add this?"
+      - name: Liskov Substitution (LSP)
+        rule: Implementations are interchangeable
+        ask:
+          - "Would swapping this implementation break callers?"
+          - "Does this implementation honor all contracts of the interface?"
+      - name: Interface Segregation (ISP)
+        rule: Small, focused interfaces
+        ask:
+          - "Does this class use every method it's forced to implement?"
+          - "Would a new implementation need to stub out methods?"
+      - name: Dependency Inversion (DIP)
+        rule: Depend on abstractions, never concrete implementations
+        ask:
+          - "Am I importing a concrete class or an interface?"
+          - "Can I swap this dependency without changing this file?"
+
+  kiss-dry:
+    active: true
+    principles:
+      - name: KISS
+        rule: Simplest solution that works. Boring code is good code.
+        ask:
+          - "Is there a simpler way to do this?"
+          - "Would a junior developer understand this immediately?"
+      - name: DRY
+        rule: If you write the same logic twice, extract it
+        ask:
+          - "Have I written this pattern elsewhere in the codebase?"
+          - "Would changing this require updating multiple places?"
+
+  no-defensive-garbage:
+    active: true
+    principles:
+      - name: No Defensive Garbage
+        rule: Let bugs surface, don't hide them. Trust contracts.
+        ask:
+          - "Am I adding a fallback that hides bugs instead of surfacing them?"
+          - "Is this try/catch swallowing errors silently?"
+          - "Am I writing null checks everywhere instead of fixing the source?"
+          - "Does this 'safe' default make debugging impossible?"
+          - "Is this a dead branch that never executes but adds cognitive load?"
+
+  composition:
+    active: true
+    principles:
+      - name: Composition over Inheritance
+        rule: Combine behaviors, don't extend them. No hierarchies deeper than 2.
+        ask:
+          - "Am I inheriting just to reuse code?"
+          - "Is this class hierarchy deeper than 2 levels?"
+      - name: Make Invalid States Unrepresentable
+        rule: Use the type system. Enums over flags. If it compiles, it's valid.
+        ask:
+          - "Can this be represented as one discriminated union instead of multiple booleans?"
+          - "Would adding a new state require changing conditionals in many places?"
+      - name: Tell, Don't Ask
+        rule: Put behavior where the data lives
+        ask:
+          - "Am I inspecting data to decide behavior instead of delegating it?"
+
+  tdd:
+    active: false
+    principles:
+      - name: Test-Driven Development
+        rule: Tests written with the code, not after. Red → Green → Refactor.
+        ask:
+          - "Did I write the test before the implementation?"
+          - "Does the test fail for the right reason before I fix it?"
+          - "Did I refactor after going green?"
+      - name: Test at boundaries
+        rule: Validate at system boundaries. Trust internals.
+        ask:
+          - "Am I testing implementation details or behavior?"
+          - "Would refactoring break this test even if behavior is unchanged?"
+
+  security:
+    active: false
+    principles:
+      - name: Input Validation
+        rule: Validate at system boundaries. Never trust external input.
+        ask:
+          - "Is this user input being passed directly to a query/command?"
+          - "Am I sanitizing before rendering?"
+      - name: Secrets Management
+        rule: API keys via env vars only. Never in config files or code.
+        ask:
+          - "Is this secret hardcoded anywhere?"
+          - "Would this appear in git history?"
+
+  # --- Project-specific groups (added via installer or manually) ---
+  # Example:
+  # my-project-rules:
+  #   active: true
+  #   principles:
+  #     - name: Always use the ORM
+  #       rule: No raw SQL queries outside migrations
+  #       ask:
+  #         - "Am I writing raw SQL instead of using the query builder?"

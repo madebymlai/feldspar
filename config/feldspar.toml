@@ -22,25 +22,48 @@ no_outcome_days = 30
 low_quality_days = 15
 with_outcome_days = 90
 
+# Skill-mapped thinking modes
+# Each mode defines: required fields, budget tier, what feldspar watches for
+
+[modes.brainstorm]
+requires = []
+budget = "standard"
+watches = "Must extract requirements not solutions, must probe gaps, must not jump to how"
+
 [modes.architecture]
 requires = ["components"]
 budget = "deep"
+watches = "Must name components, must estimate impact, must explore alternatives"
 
-[modes.performance]
-requires = ["latency"]
+[modes.problem-solving]
+requires = ["evidence"]
+budget = "deep"
+watches = "Must cite evidence, must explore alternatives, must not assume root cause"
+
+[modes.planning]
+requires = ["components"]
 budget = "standard"
+watches = "Must cover all components from arch, must scope tasks atomically, must not skip steps"
 
 [modes.debugging]
 requires = ["evidence"]
 budget = "standard"
+watches = "Must cite file paths/logs/stack traces, must verify claims, must cite threat model for security"
 
-[modes.scaling]
-requires = ["components", "throughput"]
-budget = "deep"
+[modes.implementation]
+requires = []
+budget = "minimal"
+watches = "Must stay focused on task scope, must not redesign, must not overthink"
 
-[modes.security]
+[modes.pattern-matching]
 requires = ["evidence"]
-budget = "deep"
+budget = "standard"
+watches = "Must cite specific claims from source, must verify each against target, must not skip mismatches"
+
+[modes.orchestrator]
+requires = []
+budget = "minimal"
+watches = "Must delegate not solve, must not go past 2-3 thoughts without spawning specialist, must route to correct skill"
 
 [components]
 valid = []  # populate per project
