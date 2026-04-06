@@ -1,37 +1,21 @@
-A cognitive reasoning tool for dynamic, reflective problem-solving through structured thoughts.
+Structured reasoning tool with cognitive analysis. Each call records one thought in a trace.
 
-This tool helps analyze problems through sequential thinking with built-in quality guards. Each thought is independently analyzed for cognitive biases, overconfidence, sycophancy, and depth. The tool actively pushes back when reasoning is shallow, biased, or overconfident.
+Every thought is analyzed for cognitive biases, overconfidence, sycophancy, and reasoning depth. Warnings fire automatically when issues are detected. A recap is generated every few thoughts to prevent context drift. On completion, an ADR skeleton is generated.
 
-When to use this tool:
-- Breaking down complex problems into steps
-- Architecture and design decisions
-- Performance analysis requiring quantified estimates
-- Debugging that needs evidence-based reasoning
-- Any problem where the full scope isn't clear initially
+Parameters:
+- thought: Your current reasoning step.
+- thoughtNumber: Current step (1-indexed).
+- totalThoughts: Estimated total (adjust up or down as you progress).
+- nextThoughtNeeded: True if more thinking needed. False to complete the trace.
+- thinkingMode: Domain mode (e.g. architecture, debugging, implementation). Triggers mode-specific validation.
+- affectedComponents: System components involved in this decision.
+- confidence: Your confidence in current reasoning (0-100). Independently calibrated.
+- evidence: Citations -- file paths, docs, measurements, links. Earns confidence points.
+- estimatedImpact: Expected impact -- latency, throughput, risk.
+- isRevision: True if this revises a previous thought.
+- revisesThought: Which thought number is being revised.
+- branchFromThought: Fork point to explore an alternative approach.
+- branchId: Label for the alternative branch.
+- needsMoreThoughts: Signal that you need more thoughts beyond the original estimate.
 
-Key features:
-- Adjust totalThoughts up or down as you progress
-- Revise previous thoughts when you realize they were wrong
-- Branch into alternative approaches (kills tunnel vision)
-- Receive real-time warnings: ANTI-QUICK-FIX, OVERCONFIDENCE, UNDERTHINKING, OVERTHINKING
-- Confidence is independently calibrated -- back claims with evidence
-- Every 3rd thought includes an auto-recap to prevent context drift
-- On completion, generates an ADR skeleton
-
-Thinking modes (each triggers domain-specific validation):
-- architecture: Must name affectedComponents. Warns if no impact estimate.
-- performance: Must include estimatedImpact with latency. Warns if no numbers cited.
-- debugging: Must include evidence (file paths, logs, stack traces). Warns if guessing.
-- scaling: Must estimate throughput impact. Warns if no capacity numbers.
-- security: Must cite threat model or vulnerability class. Warns if hand-waving.
-
-You should:
-1. Start with an initial estimate of needed thoughts, but be ready to adjust
-2. Set thinkingMode to get domain-specific validation
-3. Name affectedComponents from the real system (don't hallucinate)
-4. Report confidence honestly -- the calibrator will flag overconfidence
-5. Cite evidence (file paths, measurements, docs) to earn confidence points
-6. Branch when you catch yourself committing to the first idea without exploring alternatives
-7. Revise previous thoughts when you realize they were wrong
-8. Express uncertainty when present -- false confidence is worse than honest doubt
-9. Only set nextThoughtNeeded to false when truly done and a satisfactory answer is reached
+Response includes: warnings, analyzer alerts, confidence calibration, budget status, ML trajectory score, pattern recall from similar past traces, and recap.

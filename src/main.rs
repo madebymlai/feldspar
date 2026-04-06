@@ -1,20 +1,107 @@
-// Feldspar MCP server: single daemon per project, MCP over HTTP on localhost.
-// Multiple Claude Code sessions connect concurrently. One ML model, one DB, always fresh.
-//
-// Tokio runtime. HTTP requests handled async. Analyzer pipeline + ML predict are sync (microseconds).
-// Background work (DB writes, trace review, ML training) fire-and-forget via tokio::spawn.
-//
-// Startup: load config → open SQLite (WAL) → prune → bulk train ML → load model file → start HTTP server.
-// Shutdown: stop connections → flush traces → save model → close DB.
-//
-// One MCP tool: sequentialthinking. Trace review is internal (HTTP to OpenRouter).
-// Error handling: never crash. Bad input → error response. Analyzer panic → catch_unwind + skip.
-
 mod analyzers;
 mod config;
 mod db;
+mod llm;
+mod mcp;
 mod ml;
 mod pruning;
 mod thought;
 mod trace_review;
 mod warnings;
+
+use clap::{Parser, Subcommand};
+use std::sync::Arc;
+use tracing::info;
+
+#[derive(Parser)]
+#[command(name = "feldspar", about = "Cognitive reasoning MCP server")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the feldspar MCP server
+    Start {
+        /// Run as background daemon
+        #[arg(long)]
+        daemon: bool,
+        /// Port to listen on
+        #[arg(long, default_value = "3581")]
+        port: u16,
+    },
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .json()
+        .with_writer(std::io::stderr)
+        .init();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Start { daemon, port } => {
+            if daemon {
+                let exe = std::env::current_exe().expect("failed to get executable path");
+                std::process::Command::new(exe)
+                    .args(["start", "--port", &port.to_string()])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("failed to spawn daemon");
+                println!("feldspar daemon started on port {}", port);
+                return;
+            }
+
+            run_server(port).await;
+        }
+    }
+}
+
+async fn run_server(port: u16) {
+    let config = config::Config::load("config/feldspar.toml", "config/principles.toml");
+    let llm = llm::LlmClient::new(&config.llm);
+    let server = thought::ThinkingServer::new(config, llm);
+    let state = Arc::new(mcp::McpState::new(server));
+
+    let cleanup_state = state.clone();
+    tokio::spawn(mcp::session_cleanup_task(cleanup_state));
+
+    let router = mcp::create_router(state);
+    let addr = format!("127.0.0.1:{}", port);
+    info!("feldspar listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap_or_else(|e| panic!("failed to bind to {}: {}", addr, e));
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server error");
+
+    info!("feldspar shutdown complete");
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+    }
+    info!("shutdown signal received");
+}

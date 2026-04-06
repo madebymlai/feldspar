@@ -228,7 +228,7 @@ cargo build --release         # Produces single binary
 
 | Area | Implementation |
 |------|----------------|
-| **MCP transport** | stdio only (no network exposure). Read-only hints on tool annotations. |
+| **MCP transport** | HTTP on localhost only (127.0.0.1:{port}, no external exposure). Origin header validation prevents DNS rebinding. |
 | **Config loading** | Validated at startup. Invalid config = fail loud, don't fall back to defaults. |
 | **ML model** | Best-effort. Corrupted model file = log + skip predictions, never crash. |
 | **External models** | Valence_ext agents: read-only filesystem access. Write tools explicitly blocked. |

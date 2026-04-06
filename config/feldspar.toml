@@ -3,7 +3,8 @@ db_path = "feldspar.db"
 model_path = "feldspar.model"
 recap_every = 3
 
-[trace_review]
+[llm]
+base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 model = "openai/gpt-oss-20b:nitro"
 

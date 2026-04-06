@@ -1,0 +1,86 @@
+# Agent Feldspar Integration Template
+# Add this section to every agent definition. Replace <MODE> with the agent's thinking mode.
+
+feldspar:
+  thinking_mode: <MODE>
+  tool: sequentialthinking
+
+  # Universal warnings (all modes)
+  warnings:
+    - name: ANTI-QUICK-FIX
+      meaning: Shortcut language detected
+      respond: Justify the shortcut or propose a proper solution
+
+    - name: OVERCONFIDENCE
+      meaning: Reported confidence exceeds evidence
+      respond: Cite more evidence or lower your confidence
+
+    - name: UNDERTHINKING
+      meaning: Wrapping up too early for this complexity
+      respond: Keep reasoning, you haven't covered enough ground
+
+    - name: OVERTHINKING
+      meaning: Past budget with no new insights
+      respond: Make a decision or branch to a new approach
+
+    - name: NO_SELF_CHALLENGE
+      meaning: 3+ thoughts without branching or revision
+      respond: Challenge your own reasoning, explore an alternative
+
+    - name: CONFIRMATION_ONLY
+      meaning: Final conclusion matches first thought with zero corrections
+      respond: This is a red flag. Genuinely revise.
+
+    - name: PATTERN_RISK
+      meaning: ML found similar past traces that scored poorly
+      respond: Read the pattern details and adjust your approach
+
+  # Mode-specific warnings (pick the block matching <MODE>)
+  mode_warnings:
+    architecture:
+      - NO-COMPONENTS -- name affected components
+      - Must estimate impact
+      - Must explore alternatives
+
+    debugging:
+      - NO-EVIDENCE -- cite file paths, logs, stack traces
+      - Must verify claims
+      - Must not assume root cause
+
+    implementation:
+      - Must stay focused on task scope
+      - Must not redesign
+      - Must not overthink
+
+    brainstorm:
+      - Must extract requirements not solutions
+      - Must probe gaps
+      - Must not jump to how
+
+    problem-solving:
+      - Must cite evidence
+      - Must explore alternatives
+      - Must not assume root cause
+
+    planning:
+      - Must cover all components from arch
+      - Must scope tasks atomically
+      - Must not skip steps
+
+    pattern-matching:
+      - Must cite specific claims from source
+      - Must verify each against target
+      - Must not skip mismatches
+
+    orchestrator:
+      - Must delegate not solve
+      - Must not go past 2-3 thoughts without spawning specialist
+      - Must route to correct skill
+
+  # Shutdown boilerplate (required for all agents)
+  shutdown:
+    instruction: |
+      When you receive a shutdown_request message, use the SendMessage tool
+      to reply to the team lead with this exact JSON as the message parameter:
+      {"type": "shutdown_response", "request_id": "[request_id]", "approve": true}
+      Do NOT print this as text. You MUST use the SendMessage tool. Then stop all work.
