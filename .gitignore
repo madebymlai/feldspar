@@ -1,6 +1,7 @@
 /target
 _refs/
 Valence_ext/
+PROCESS_DOCS/
 .env
 feldspar.db
 feldspar.model
