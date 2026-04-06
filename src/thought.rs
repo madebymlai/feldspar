@@ -1,11 +1,17 @@
+use crate::analyzers::run_pipeline;
 use crate::config::Config;
 use crate::llm::LlmClient;
+use crate::warnings::generate_warnings;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub type Timestamp = i64;
+
+/// (is_revision, branch_from_thought) for last 3 records on current branch.
+/// Used by warning engine to check for recent progress.
+pub type RecentProgress = Vec<(bool, Option<u32>)>;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,7 +73,7 @@ pub struct WireResponse {
     pub thought_history_length: usize,
 
     // From ThoughtResult (some renamed) — only included when non-empty/non-null
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    // warnings always present (even empty) so Claude sees the field exists
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub alerts: Vec<Alert>,
@@ -198,6 +204,15 @@ impl ThinkingServer {
 
             let trace = traces.get_mut(&trace_id).unwrap();
 
+            // Clone branch-filtered records BEFORE pushing current thought.
+            // Observers receive history only — not the thought they're analyzing.
+            let branch_records: Vec<ThoughtInput> = trace
+                .thoughts
+                .iter()
+                .filter(|t| t.input.branch_id == input.branch_id)
+                .map(|t| t.input.clone())
+                .collect();
+
             // Append record
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -223,20 +238,19 @@ impl ThinkingServer {
 
             // Determine budget from config
             let (budget_used, budget_max, budget_category) =
-                if let Some(ref mode) = input.thinking_mode {
-                    if let Some(mode_config) = self.config.modes.get(mode) {
-                        let tier = &mode_config.budget;
-                        if let Some(range) = self.config.budgets.get(tier) {
-                            (input.thought_number, range[1], tier.clone())
-                        } else {
-                            (input.thought_number, 5, "standard".into())
-                        }
-                    } else {
-                        (input.thought_number, 5, "standard".into())
-                    }
-                } else {
-                    (input.thought_number, 5, "standard".into())
+                match self.config.resolve_budget(input.thinking_mode.as_deref()) {
+                    Some((_, max, tier)) => (input.thought_number, max, tier),
+                    None => (input.thought_number, 5, "standard".into()),
                 };
+
+            // Extract recent progress for warning engine
+            let recent_progress: RecentProgress = trace.thoughts
+                .iter()
+                .filter(|t| t.input.branch_id == input.branch_id)
+                .rev()
+                .take(3)
+                .map(|t| (t.input.is_revision, t.input.branch_from_thought))
+                .collect();
 
             // If recap due: extract branch-filtered thought texts for Phase 2
             if input.thought_number > 1
@@ -265,6 +279,8 @@ impl ThinkingServer {
                 budget_used,
                 budget_max,
                 budget_category,
+                recent_progress,
+                branch_records,
             };
             // Write lock drops here
         }
@@ -301,6 +317,11 @@ impl ThinkingServer {
             });
         }
 
+        let pipeline = run_pipeline(&input, &snapshot.branch_records, &self.config);
+
+        let mut warnings = generate_warnings(&input, &snapshot.recent_progress, &self.config);
+        warnings.extend(pipeline.panic_warnings);
+
         Ok(WireResponse {
             trace_id: snapshot.trace_id,
             thought_number: input.thought_number,
@@ -308,14 +329,17 @@ impl ThinkingServer {
             next_thought_needed: input.next_thought_needed,
             branches: snapshot.branches,
             thought_history_length: snapshot.thought_history_length,
-            warnings: vec![],
-            alerts: vec![],
+            warnings,
+            alerts: pipeline.alerts,
             confidence_reported: input.confidence,
-            confidence_calculated: None,
-            confidence_gap: None,
-            bias_detected: None,
-            sycophancy: None,
-            depth_overlap: None,
+            confidence_calculated: pipeline.confidence_calculated,
+            confidence_gap: match (input.confidence, pipeline.confidence_calculated) {
+                (Some(reported), Some(calculated)) => Some((reported - calculated).abs()),
+                _ => None,
+            },
+            bias_detected: pipeline.observations.bias_detected,
+            sycophancy: pipeline.sycophancy_pattern,
+            depth_overlap: pipeline.observations.prev_overlap,
             budget_used: snapshot.budget_used,
             budget_max: snapshot.budget_max,
             budget_category: snapshot.budget_category,
@@ -347,6 +371,8 @@ struct TraceSnapshot {
     budget_used: u32,
     budget_max: u32,
     budget_category: String,
+    recent_progress: RecentProgress,
+    branch_records: Vec<ThoughtInput>,
 }
 
 fn generate_adr(trace: &Trace) -> String {

@@ -66,8 +66,9 @@ impl LlmClient {
                 {"role": "system", "content": system},
                 {"role": "user", "content": user}
             ],
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"}
+            "max_completion_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+            "reasoning_format": "parsed"
         });
 
         let resp = match req.json(&body).send().await {

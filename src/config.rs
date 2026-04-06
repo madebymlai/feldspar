@@ -88,6 +88,16 @@ pub struct Principle {
 }
 
 impl Config {
+    /// Resolve thinking mode to budget (min, max, tier_name).
+    /// Returns None if mode is None or not found in config.
+    pub fn resolve_budget(&self, mode: Option<&str>) -> Option<(u32, u32, String)> {
+        let mode_name = mode?;
+        let mode_config = self.modes.get(mode_name)?;
+        let tier = &mode_config.budget;
+        let range = self.budgets.get(tier)?;
+        Some((range[0], range[1], tier.clone()))
+    }
+
     pub fn load(toml_path: &str, principles_path: &str) -> Arc<Config> {
         let toml_str = std::fs::read_to_string(toml_path)
             .unwrap_or_else(|e| panic!("failed to read config '{}': {}", toml_path, e));
@@ -218,14 +228,32 @@ mod tests {
                 low_quality_days: 15,
                 with_outcome_days: 90,
             },
-            modes: HashMap::from([(
-                "test-mode".into(),
-                ModeConfig {
-                    requires: vec![],
-                    budget: "standard".into(),
-                    watches: "test watches".into(),
-                },
-            )]),
+            modes: HashMap::from([
+                (
+                    "test-mode".into(),
+                    ModeConfig {
+                        requires: vec![],
+                        budget: "standard".into(),
+                        watches: "test watches".into(),
+                    },
+                ),
+                (
+                    "architecture".into(),
+                    ModeConfig {
+                        requires: vec!["components".into()],
+                        budget: "deep".into(),
+                        watches: String::new(),
+                    },
+                ),
+                (
+                    "implementation".into(),
+                    ModeConfig {
+                        requires: vec![],
+                        budget: "minimal".into(),
+                        watches: String::new(),
+                    },
+                ),
+            ]),
             components: ComponentsConfig { valid: vec![] },
             principles: vec![],
         }
@@ -396,5 +424,29 @@ valid = []
             },
         );
         validate(&config, &[]);
+    }
+
+    #[test]
+    fn test_resolve_budget_architecture() {
+        let config = test_config();
+        assert_eq!(config.resolve_budget(Some("architecture")), Some((5, 8, "deep".into())));
+    }
+
+    #[test]
+    fn test_resolve_budget_implementation() {
+        let config = test_config();
+        assert_eq!(config.resolve_budget(Some("implementation")), Some((2, 3, "minimal".into())));
+    }
+
+    #[test]
+    fn test_resolve_budget_unknown_mode() {
+        let config = test_config();
+        assert_eq!(config.resolve_budget(Some("nonexistent")), None);
+    }
+
+    #[test]
+    fn test_resolve_budget_none_mode() {
+        let config = test_config();
+        assert_eq!(config.resolve_budget(None), None);
     }
 }

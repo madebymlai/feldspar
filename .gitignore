@@ -1,6 +1,6 @@
 /target
 _refs/
-Valence_ext/node_modules/
+Valence_ext/
 .env
 feldspar.db
 feldspar.model
