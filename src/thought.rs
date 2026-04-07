@@ -323,7 +323,46 @@ impl ThinkingServer {
             }
         }
 
-        // Spawn background tasks for evicted trace
+        // Trust scoring (blocking — deliberate HC#2 exception: user sees score in completion response)
+        let (trust_score, trust_reason, mut trust_warnings) = if let Some(ref trace) = removed_trace {
+            let mode = trace.thoughts.first()
+                .and_then(|t| t.input.thinking_mode.as_deref());
+
+            match mode {
+                None => {
+                    (None, None, vec!["THINKING_MODE_MISSING".into()])
+                }
+                Some(mode) => {
+                    match self.llm.as_ref() {
+                        Some(llm) if llm.has_api_key() => {
+                            match crate::trace_review::review(llm, trace, mode).await {
+                                Some(score) => (Some(score.trust), Some(score.reason), vec![]),
+                                None => (None, None, vec!["TRUST_SCORE_UNAVAILABLE".into()]),
+                            }
+                        }
+                        _ => {
+                            (None, None, vec!["OPENROUTER_KEY_NOT_SET".into()])
+                        }
+                    }
+                }
+            }
+        } else {
+            (None, None, vec![])
+        };
+
+        // Persist trust score to DB (best-effort, background)
+        if let Some(ref trace) = removed_trace {
+            if let (Some(db), Some(score), Some(reason)) = (&self.db, trust_score, &trust_reason) {
+                let db = db.clone();
+                let trace_id = trace.id.clone();
+                let reason = reason.clone();
+                tokio::spawn(async move {
+                    db.update_trust(&trace_id, score, &reason).await;
+                });
+            }
+        }
+
+        // Background tasks for evicted trace (move — last use of removed_trace)
         if let Some(trace) = removed_trace {
             let trace = Arc::new(trace);
 
@@ -340,16 +379,11 @@ impl ThinkingServer {
                 ).await;
             }
 
-            // 2. Trace review → trust score → ML train (spawned)
-            if let (Some(db), Some(_llm)) = (&self.db, &self.llm) {
-                let _db = db.clone();
-                let _trace_id = snapshot.trace_id.clone();
-                let _t = trace.clone();
-                tokio::spawn(async move {
-                    // trace_review → db.update_trust → ml.train
-                    // Wired when trace review + ML are implemented
-                });
-            }
+            // 2. ML train (spawned)
+            let t2 = trace.clone();
+            tokio::spawn(async move {
+                let _ = &t2; // ml.train — no-op until ML implemented
+            });
 
             // 3. ML compute leaf nodes + update cache (spawned)
             if let Some(ref db) = self.db {
@@ -357,6 +391,7 @@ impl ThinkingServer {
                 let _trace_id = snapshot.trace_id.clone();
                 let _cache = self.leaf_cache.clone();
                 tokio::spawn(async move {
+                    let _ = &trace;
                     // ml.predict_nodes → db.store_leaf_nodes → cache.write().insert()
                     // Wired when ML is implemented
                 });
@@ -367,6 +402,7 @@ impl ThinkingServer {
 
         let mut warnings = generate_warnings(&input, &snapshot.recent_progress, &self.config);
         warnings.extend(pipeline.panic_warnings);
+        warnings.append(&mut trust_warnings);
 
         // Spawn write_thought for every thought (best-effort)
         if let Some(ref db) = self.db {
@@ -417,8 +453,8 @@ impl ThinkingServer {
             drift_detected: None,
             recap,
             adr,
-            trust_score: None,
-            trust_reason: None,
+            trust_score,
+            trust_reason,
             pattern_recall: None, // Populated when ML implements find_similar
         })
     }
@@ -480,8 +516,9 @@ fn generate_adr(trace: &Trace) -> String {
     for t in &trace.thoughts {
         if let Some(ref bid) = t.input.branch_id {
             if seen_branches.insert(bid.clone()) {
-                let text = if t.input.thought.len() > 100 {
-                    format!("{}: {}...", bid, &t.input.thought[..100])
+                let truncated: String = t.input.thought.chars().take(100).collect();
+                let text = if truncated.len() < t.input.thought.len() {
+                    format!("{}: {}...", bid, truncated)
                 } else {
                     format!("{}: {}", bid, t.input.thought)
                 };
@@ -1031,6 +1068,31 @@ mod tests {
         assert_eq!(adr1, adr2, "ADR output must be deterministic");
     }
 
+    #[test]
+    fn test_generate_adr_multibyte_truncation() {
+        // 50 CJK chars (3 bytes each) + 51 ASCII chars = 101 chars total → should truncate
+        let text = format!("{}{}", "你".repeat(50), "a".repeat(51));
+        let trace = make_trace_with_thoughts(vec![
+            ("main", None, vec![], None),
+            (&text, Some("alt"), vec![], None),
+        ]);
+        let adr = generate_adr(&trace);
+        assert!(adr.contains("alt"), "branch label present");
+        assert!(adr.contains("..."), "truncation marker present");
+    }
+
+    #[test]
+    fn test_generate_adr_no_truncation_under_100() {
+        let text = "a".repeat(50);
+        let trace = make_trace_with_thoughts(vec![
+            ("main", None, vec![], None),
+            (&text, Some("alt"), vec![], None),
+        ]);
+        let adr = generate_adr(&trace);
+        assert!(!adr.contains("..."), "no truncation for 50 chars");
+        assert!(adr.contains(&text), "full text present");
+    }
+
     // --- Eviction tests ---
 
     #[tokio::test]
@@ -1122,5 +1184,63 @@ mod tests {
         };
         let json_str = serde_json::to_string(&wire).unwrap();
         assert!(!json_str.contains("patternRecall"), "patternRecall absent when None");
+    }
+
+    // --- Trust scoring completion path tests ---
+
+    #[tokio::test]
+    async fn test_process_thought_trust_warning_missing_mode() {
+        let server = test_server();
+        let mut input = test_input(1, None, false); // nextThoughtNeeded = false
+        input.thinking_mode = None;
+        let wire = server.process_thought(input).await.unwrap(); // Must be Ok, not Err
+        assert!(wire.warnings.contains(&"THINKING_MODE_MISSING".to_string()));
+        assert!(wire.trust_score.is_none());
+        assert!(wire.trust_reason.is_none());
+        assert!(wire.adr.is_some(), "ADR preserved despite missing mode");
+    }
+
+    #[tokio::test]
+    async fn test_process_thought_trust_warning_no_api_key() {
+        // test_server() creates ThinkingServer with llm: None
+        let server = test_server();
+        let mut input = test_input(1, None, false);
+        input.thinking_mode = Some("debugging".into());
+        let wire = server.process_thought(input).await.unwrap();
+        assert!(wire.warnings.iter().any(|w| w == "OPENROUTER_KEY_NOT_SET"));
+        assert!(wire.trust_score.is_none());
+        assert!(wire.trust_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_process_thought_no_trust_on_continuation() {
+        // Non-completion thoughts should have no trust fields
+        let server = test_server();
+        let mut input = test_input(1, None, true); // nextThoughtNeeded = true
+        input.thinking_mode = Some("debugging".into());
+        let wire = server.process_thought(input).await.unwrap();
+        assert!(wire.trust_score.is_none());
+        assert!(wire.trust_reason.is_none());
+        // No trust-related warnings
+        assert!(!wire.warnings.iter().any(|w|
+            w.contains("TRUST") || w.contains("THINKING_MODE") || w.contains("OPENROUTER")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_process_thought_completion_preserves_adr_with_mode() {
+        // Even when trust scoring fails (no LLM), ADR should be present
+        let server = test_server();
+        let mut input1 = test_input(1, None, true);
+        input1.thinking_mode = Some("architecture".into());
+        let w1 = server.process_thought(input1).await.unwrap();
+        let id = w1.trace_id.clone();
+
+        let mut input2 = test_input(2, Some(id), false);
+        input2.thinking_mode = Some("architecture".into());
+        input2.thought = "final decision here".into();
+        let w2 = server.process_thought(input2).await.unwrap();
+        assert!(w2.adr.is_some());
+        assert!(w2.adr.unwrap().contains("final decision here"));
     }
 }

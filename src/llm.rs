@@ -43,6 +43,10 @@ impl LlmClient {
         })
     }
 
+    pub fn has_api_key(&self) -> bool {
+        self.api_key.is_some()
+    }
+
     pub async fn chat_json(
         &self,
         system: &str,
@@ -146,5 +150,40 @@ mod tests {
         let config = local_config(None);
         let client = LlmClient::new(&config).expect("client should build");
         assert_eq!(client.base_url, "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn test_has_api_key_true() {
+        unsafe { std::env::set_var("TEST_HAS_KEY", "somevalue"); }
+        let config = LlmConfig {
+            base_url: None,
+            api_key_env: Some("TEST_HAS_KEY".into()),
+            model: "test".into(),
+        };
+        let client = LlmClient::new(&config).unwrap();
+        assert!(client.has_api_key());
+        unsafe { std::env::remove_var("TEST_HAS_KEY"); }
+    }
+
+    #[test]
+    fn test_has_api_key_false() {
+        let config = LlmConfig {
+            base_url: None,
+            api_key_env: Some("NONEXISTENT_VAR_12345".into()),
+            model: "test".into(),
+        };
+        let client = LlmClient::new(&config).unwrap();
+        assert!(!client.has_api_key());
+    }
+
+    #[test]
+    fn test_has_api_key_none_env() {
+        let config = LlmConfig {
+            base_url: None,
+            api_key_env: None,
+            model: "test".into(),
+        };
+        let client = LlmClient::new(&config).unwrap();
+        assert!(!client.has_api_key());
     }
 }
