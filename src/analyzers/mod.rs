@@ -321,7 +321,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::thought::Severity;
     use crate::config::{
-        ComponentsConfig, FeldsparConfig, LlmConfig, ModeConfig, PruningConfig, ThresholdsConfig,
+        ComponentsConfig, FeldsparConfig, LlmConfig, ModeConfig, ThresholdsConfig,
     };
     use std::collections::HashMap;
 
@@ -331,6 +331,7 @@ pub(crate) mod tests {
                 db_path: "test.db".into(),
                 model_path: "test.model".into(),
                 recap_every: 3,
+                pattern_recall_top_k: 3,
             },
             llm: LlmConfig {
                 base_url: None,
@@ -347,11 +348,6 @@ pub(crate) mod tests {
                 ("standard".into(), [3, 5]),
                 ("deep".into(), [5, 8]),
             ]),
-            pruning: PruningConfig {
-                no_outcome_days: 30,
-                low_quality_days: 15,
-                with_outcome_days: 90,
-            },
             modes: HashMap::from([
                 (
                     "architecture".into(),

@@ -421,6 +421,7 @@ mod tests {
                 db_path: "test.db".into(),
                 model_path: "test.model".into(),
                 recap_every: 3,
+                pattern_recall_top_k: 3,
             },
             llm: crate::config::LlmConfig {
                 base_url: None,
@@ -437,11 +438,6 @@ mod tests {
                 ("standard".into(), [3, 5]),
                 ("deep".into(), [5, 8]),
             ]),
-            pruning: crate::config::PruningConfig {
-                no_outcome_days: 30,
-                low_quality_days: 15,
-                with_outcome_days: 90,
-            },
             modes: HashMap::from([(
                 "architecture".into(),
                 crate::config::ModeConfig {
@@ -456,8 +452,15 @@ mod tests {
     }
 
     fn test_app() -> Router<()> {
+        use std::collections::HashMap;
+        use tokio::sync::RwLock;
         let config = test_config();
-        let server = ThinkingServer::new(config, None);
+        let server = ThinkingServer::new(
+            config,
+            None,
+            None,
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let state = Arc::new(McpState::new(server));
         create_router(state)
     }

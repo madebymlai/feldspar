@@ -256,8 +256,7 @@ mod tests {
     #[test]
     fn test_availability_no_components_no_detection() {
         use crate::config::{
-            ComponentsConfig, FeldsparConfig, LlmConfig, ModeConfig, PruningConfig,
-            ThresholdsConfig,
+            ComponentsConfig, FeldsparConfig, LlmConfig, ThresholdsConfig,
         };
         use std::collections::HashMap;
 
@@ -266,6 +265,7 @@ mod tests {
                 db_path: "test.db".into(),
                 model_path: "test.model".into(),
                 recap_every: 3,
+                pattern_recall_top_k: 3,
             },
             llm: LlmConfig {
                 base_url: None,
@@ -278,11 +278,6 @@ mod tests {
                 overthinking_multiplier: 2.0,
             },
             budgets: HashMap::from([("standard".into(), [3u32, 5u32])]),
-            pruning: PruningConfig {
-                no_outcome_days: 30,
-                low_quality_days: 15,
-                with_outcome_days: 90,
-            },
             modes: HashMap::new(),
             components: ComponentsConfig { valid: vec![] }, // empty — no detection
             principles: vec![],

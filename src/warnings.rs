@@ -238,6 +238,7 @@ mod tests {
                 db_path: String::new(),
                 model_path: String::new(),
                 recap_every: 3,
+                pattern_recall_top_k: 3,
             },
             llm: LlmConfig {
                 base_url: None,
@@ -250,11 +251,6 @@ mod tests {
                 overthinking_multiplier: 2.0,
             },
             budgets,
-            pruning: PruningConfig {
-                no_outcome_days: 30,
-                low_quality_days: 15,
-                with_outcome_days: 90,
-            },
             modes,
             components: ComponentsConfig { valid: vec![] },
             principles: vec![],

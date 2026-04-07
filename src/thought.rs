@@ -13,7 +13,7 @@ pub type Timestamp = i64;
 /// Used by warning engine to check for recent progress.
 pub type RecentProgress = Vec<(bool, Option<u32>)>;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThoughtInput {
     #[serde(default)]
@@ -106,6 +106,10 @@ pub struct WireResponse {
     pub trust_score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_reason: Option<String>,
+
+    // Pattern recall (thought 1 only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern_recall: Option<Vec<crate::db::PatternMatch>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -156,25 +160,31 @@ impl Trace {
     }
 }
 
-pub struct DbPool;
 pub struct MlModel;
 
 pub struct ThinkingServer {
     pub traces: RwLock<HashMap<String, Trace>>,
     pub config: Arc<Config>,
-    pub db: Option<DbPool>,
+    pub db: Option<Arc<crate::db::Db>>,
     pub ml: Option<MlModel>,
     pub llm: Option<LlmClient>,
+    pub leaf_cache: Arc<RwLock<HashMap<String, Vec<usize>>>>,
 }
 
 impl ThinkingServer {
-    pub fn new(config: Arc<Config>, llm: Option<LlmClient>) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        llm: Option<LlmClient>,
+        db: Option<Arc<crate::db::Db>>,
+        leaf_cache: Arc<RwLock<HashMap<String, Vec<usize>>>>,
+    ) -> Self {
         Self {
             traces: RwLock::new(HashMap::new()),
             config,
-            db: None,
+            db,
             ml: None,
             llm,
+            leaf_cache,
         }
     }
 
@@ -301,26 +311,86 @@ impl ThinkingServer {
             None
         };
 
+        // Prune on session start (thought 1)
+        if input.thought_number == 1 {
+            if let Some(ref db) = self.db {
+                let _db = db.clone();
+                let _cache = self.leaf_cache.clone();
+                tokio::spawn(async move {
+                    // ml.identify_low_value_traces → db.prune → cache evict
+                    // Wired when ML is implemented
+                });
+            }
+        }
+
         // Spawn background tasks for evicted trace
         if let Some(trace) = removed_trace {
             let trace = Arc::new(trace);
-            let t1 = trace.clone();
-            tokio::spawn(async move {
-                let _ = &t1; // db_flush — no-op
-            });
-            let t2 = trace.clone();
-            tokio::spawn(async move {
-                let _ = &t2; // trace_review — no-op
-            });
-            tokio::spawn(async move {
-                let _ = &trace; // ml_train — no-op
-            });
+
+            // 1. Flush trace — AWAITED, must complete before UPDATE tasks
+            if let Some(ref db) = self.db {
+                let components: Vec<String> = trace.thoughts.iter()
+                    .flat_map(|t| t.input.affected_components.iter().cloned())
+                    .collect::<BTreeSet<_>>().into_iter().collect();
+                db.flush_trace(
+                    &snapshot.trace_id,
+                    input.thinking_mode.as_deref(),
+                    &components,
+                    trace.created_at,
+                ).await;
+            }
+
+            // 2. Trace review → trust score → ML train (spawned)
+            if let (Some(db), Some(_llm)) = (&self.db, &self.llm) {
+                let _db = db.clone();
+                let _trace_id = snapshot.trace_id.clone();
+                let _t = trace.clone();
+                tokio::spawn(async move {
+                    // trace_review → db.update_trust → ml.train
+                    // Wired when trace review + ML are implemented
+                });
+            }
+
+            // 3. ML compute leaf nodes + update cache (spawned)
+            if let Some(ref db) = self.db {
+                let _db = db.clone();
+                let _trace_id = snapshot.trace_id.clone();
+                let _cache = self.leaf_cache.clone();
+                tokio::spawn(async move {
+                    // ml.predict_nodes → db.store_leaf_nodes → cache.write().insert()
+                    // Wired when ML is implemented
+                });
+            }
         }
 
         let pipeline = run_pipeline(&input, &snapshot.branch_records, &self.config);
 
         let mut warnings = generate_warnings(&input, &snapshot.recent_progress, &self.config);
         warnings.extend(pipeline.panic_warnings);
+
+        // Spawn write_thought for every thought (best-effort)
+        if let Some(ref db) = self.db {
+            let db = db.clone();
+            let trace_id = snapshot.trace_id.clone();
+            let thought_number = input.thought_number;
+            let thinking_mode = input.thinking_mode.clone();
+            let input_json = serde_json::to_string(&input).unwrap_or_default();
+            let result_json = "{}".to_owned();
+            let created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            tokio::spawn(async move {
+                db.write_thought(
+                    &trace_id,
+                    thought_number,
+                    thinking_mode.as_deref(),
+                    &input_json,
+                    &result_json,
+                    created_at,
+                ).await;
+            });
+        }
 
         Ok(WireResponse {
             trace_id: snapshot.trace_id,
@@ -349,6 +419,7 @@ impl ThinkingServer {
             adr,
             trust_score: None,
             trust_reason: None,
+            pattern_recall: None, // Populated when ML implements find_similar
         })
     }
 
@@ -495,6 +566,7 @@ mod tests {
                 db_path: "test.db".into(),
                 model_path: "test.model".into(),
                 recap_every: 3,
+                pattern_recall_top_k: 3,
             },
             llm: crate::config::LlmConfig {
                 base_url: None,
@@ -511,11 +583,6 @@ mod tests {
                 ("standard".into(), [3, 5]),
                 ("deep".into(), [5, 8]),
             ]),
-            pruning: crate::config::PruningConfig {
-                no_outcome_days: 30,
-                low_quality_days: 15,
-                with_outcome_days: 90,
-            },
             modes: HashMap::from([
                 (
                     "architecture".into(),
@@ -537,7 +604,7 @@ mod tests {
             components: crate::config::ComponentsConfig { valid: vec![] },
             principles: vec![],
         };
-        ThinkingServer::new(Arc::new(config), None)
+        ThinkingServer::new(Arc::new(config), None, None, Arc::new(RwLock::new(HashMap::new())))
     }
 
     // --- Task 1 tests ---
@@ -595,6 +662,7 @@ mod tests {
             adr: None,
             trust_score: None,
             trust_reason: None,
+            pattern_recall: None,
         };
         let value = serde_json::to_value(&wire).unwrap();
         assert!(value["traceId"].is_string());
@@ -630,6 +698,7 @@ mod tests {
             adr: None,
             trust_score: None,
             trust_reason: None,
+            pattern_recall: None,
         };
         let value = serde_json::to_value(&wire).unwrap();
         assert!(value.get("trajectory").is_some());
@@ -775,7 +844,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_new() {
         let config = Config::load("config/feldspar.toml", "config/principles.toml");
-        let server = ThinkingServer::new(config, None);
+        let server = ThinkingServer::new(config, None, None, Arc::new(RwLock::new(HashMap::new())));
         assert!(server.db.is_none());
         assert!(server.ml.is_none());
         assert!(server.llm.is_none());
@@ -1012,5 +1081,46 @@ mod tests {
     fn test_unix_millis_to_date_epoch() {
         let date = unix_millis_to_date(0);
         assert_eq!(date, "1970-01-01");
+    }
+
+    // --- pattern_recall tests ---
+
+    #[tokio::test]
+    async fn test_process_thought_returns_pattern_recall_none() {
+        let server = test_server();
+        let wire = server.process_thought(test_input(1, None, true)).await.unwrap();
+        assert!(wire.pattern_recall.is_none(), "pattern_recall is None when ML not wired");
+    }
+
+    #[test]
+    fn test_wire_response_serialization_skips_none_pattern_recall() {
+        let wire = WireResponse {
+            trace_id: "t1".into(),
+            thought_number: 1,
+            total_thoughts: 3,
+            next_thought_needed: true,
+            branches: vec![],
+            thought_history_length: 1,
+            warnings: vec![],
+            alerts: vec![],
+            confidence_reported: None,
+            confidence_calculated: None,
+            confidence_gap: None,
+            bias_detected: None,
+            sycophancy: None,
+            depth_overlap: None,
+            budget_used: 1,
+            budget_max: 5,
+            budget_category: "standard".into(),
+            trajectory: None,
+            drift_detected: None,
+            recap: None,
+            adr: None,
+            trust_score: None,
+            trust_reason: None,
+            pattern_recall: None,
+        };
+        let json_str = serde_json::to_string(&wire).unwrap();
+        assert!(!json_str.contains("patternRecall"), "patternRecall absent when None");
     }
 }

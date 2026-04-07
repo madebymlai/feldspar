@@ -11,7 +11,6 @@ pub struct Config {
     pub llm: LlmConfig,
     pub thresholds: ThresholdsConfig,
     pub budgets: HashMap<String, [u32; 2]>,
-    pub pruning: PruningConfig,
     pub modes: HashMap<String, ModeConfig>,
     pub components: ComponentsConfig,
     #[serde(skip)]
@@ -23,7 +22,11 @@ pub struct FeldsparConfig {
     pub db_path: String,
     pub model_path: String,
     pub recap_every: u32,
+    #[serde(default = "default_top_k")]
+    pub pattern_recall_top_k: u32,
 }
+
+fn default_top_k() -> u32 { 3 }
 
 #[derive(Debug, Deserialize)]
 pub struct LlmConfig {
@@ -37,13 +40,6 @@ pub struct ThresholdsConfig {
     pub confidence_gap: f64,
     pub over_analysis_multiplier: f64,
     pub overthinking_multiplier: f64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PruningConfig {
-    pub no_outcome_days: u32,
-    pub low_quality_days: u32,
-    pub with_outcome_days: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,18 +159,6 @@ fn validate(config: &Config, principles: &[PrincipleGroup]) {
     // Numeric sanity
     assert!(config.feldspar.recap_every >= 2, "recap_every must be >= 2 (LLM call per thought is too expensive)");
     assert!(
-        config.pruning.no_outcome_days > 0,
-        "pruning.no_outcome_days must be > 0"
-    );
-    assert!(
-        config.pruning.low_quality_days > 0,
-        "pruning.low_quality_days must be > 0"
-    );
-    assert!(
-        config.pruning.with_outcome_days > 0,
-        "pruning.with_outcome_days must be > 0"
-    );
-    assert!(
         config.thresholds.confidence_gap > 0.0,
         "thresholds.confidence_gap must be > 0"
     );
@@ -207,6 +191,7 @@ mod tests {
                 db_path: "test.db".into(),
                 model_path: "test.model".into(),
                 recap_every: 3,
+                pattern_recall_top_k: 3,
             },
             llm: LlmConfig {
                 base_url: None,
@@ -223,11 +208,6 @@ mod tests {
                 ("standard".into(), [3, 5]),
                 ("deep".into(), [5, 8]),
             ]),
-            pruning: PruningConfig {
-                no_outcome_days: 30,
-                low_quality_days: 15,
-                with_outcome_days: 90,
-            },
             modes: HashMap::from([
                 (
                     "test-mode".into(),
@@ -355,11 +335,6 @@ overthinking_multiplier = 2.0
 [budgets]
 standard = [3, 5]
 
-[pruning]
-no_outcome_days = 30
-low_quality_days = 15
-with_outcome_days = 90
-
 [modes]
 
 [components]
@@ -448,5 +423,62 @@ valid = []
     fn test_resolve_budget_none_mode() {
         let config = test_config();
         assert_eq!(config.resolve_budget(None), None);
+    }
+
+    #[test]
+    fn test_pattern_recall_top_k_default() {
+        let toml = r#"
+[feldspar]
+db_path = "test.db"
+model_path = "test.model"
+recap_every = 3
+
+[llm]
+model = "test-model"
+
+[thresholds]
+confidence_gap = 25.0
+over_analysis_multiplier = 1.5
+overthinking_multiplier = 2.0
+
+[budgets]
+standard = [3, 5]
+
+[modes]
+
+[components]
+valid = []
+"#;
+        let config: Config = toml::from_str(toml).expect("should parse");
+        assert_eq!(config.feldspar.pattern_recall_top_k, 3);
+    }
+
+    #[test]
+    fn test_pattern_recall_top_k_custom() {
+        let toml = r#"
+[feldspar]
+db_path = "test.db"
+model_path = "test.model"
+recap_every = 3
+pattern_recall_top_k = 5
+
+[llm]
+model = "test-model"
+
+[thresholds]
+confidence_gap = 25.0
+over_analysis_multiplier = 1.5
+overthinking_multiplier = 2.0
+
+[budgets]
+standard = [3, 5]
+
+[modes]
+
+[components]
+valid = []
+"#;
+        let config: Config = toml::from_str(toml).expect("should parse");
+        assert_eq!(config.feldspar.pattern_recall_top_k, 5);
     }
 }
