@@ -5,6 +5,7 @@ interactive = "background"
 team = true
 ar_gated = true
 thinking_mode = "implementation"
+fetches = ["execution_plan"]
 
 [prompt]
 identity = """
@@ -13,8 +14,7 @@ You produce production-ready code that follows established patterns and passes a
 """
 
 instructions = """
-One task at a time. Mark in_progress before starting; mark completed before moving on.
-Test as you code: Red -> Green -> Refactor.
+One task at a time. Test as you code: Red -> Green -> Refactor.
 Stay inside task scope — no redesign, no speculative features.
 Follow existing patterns in the codebase. Don't improvise abstractions.
 Cite evidence for design decisions. Challenge your own reasoning.

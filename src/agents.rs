@@ -37,6 +37,8 @@ struct RawAgentSection {
     team: bool,
     ar_gated: bool,
     thinking_mode: String,
+    #[serde(default)]
+    fetches: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +67,7 @@ pub struct AgentDef {
     pub prompt: String,
     pub mode_warnings: Vec<String>,
     pub shutdown: String,
+    pub fetches: Vec<String>,
 }
 
 fn parse_agent_def(raw: RawAgentToml) -> AgentDef {
@@ -82,6 +85,7 @@ fn parse_agent_def(raw: RawAgentToml) -> AgentDef {
         ),
         mode_warnings: raw.warnings.mode,
         shutdown: raw.shutdown.instruction,
+        fetches: raw.agent.fetches,
     }
 }
 
@@ -197,6 +201,19 @@ pub fn temper(agent: &AgentDef, config: &Config, prefix: &str) -> String {
         output.push_str("2. Call `judge` with the artifact name to get a quality verdict\n");
         output.push_str("3. If verdict is \"revise\", address the feedback and repeat steps 1-2\n");
         output.push_str("4. If verdict is \"approve\", signal done to the orchestrator\n");
+    }
+
+    if !agent.fetches.is_empty() {
+        output.push_str("\n\n## Context (fetch these before starting)\n\n");
+        for (i, artifact_type) in agent.fetches.iter().enumerate() {
+            output.push_str(&format!(
+                "{}. Call `fetch` with prefix \"{}\" and type \"{}\"\n",
+                i + 1,
+                prefix,
+                artifact_type
+            ));
+        }
+        output.push('\n');
     }
 
     output
@@ -448,6 +465,27 @@ instruction = "Custom shutdown."
     }
 
     #[test]
+    fn test_solve_fetches_brief() {
+        let agents = load_agents("test");
+        let solve = agents.get("solve").unwrap();
+        assert_eq!(solve.fetches, vec!["brief"]);
+    }
+
+    #[test]
+    fn test_arm_fetches_empty() {
+        let agents = load_agents("test");
+        let arm = agents.get("arm").unwrap();
+        assert!(arm.fetches.is_empty());
+    }
+
+    #[test]
+    fn test_breakdown_fetches_two() {
+        let agents = load_agents("test");
+        let breakdown = agents.get("breakdown").unwrap();
+        assert_eq!(breakdown.fetches, vec!["brief", "design"]);
+    }
+
+    #[test]
     fn test_temper_includes_prefix() {
         let agents = load_agents("test");
         let agent = agents.get("build").unwrap();
@@ -476,5 +514,35 @@ instruction = "Custom shutdown."
         let config = test_config_empty_principles();
         let output = temper(agent, &config, "test");
         assert!(!output.contains("## Artifact Protocol"), "arm agent must not have Artifact Protocol");
+    }
+
+    #[test]
+    fn test_temper_solve_has_fetch_instructions() {
+        let agents = load_agents("test");
+        let agent = agents.get("solve").unwrap();
+        let config = test_config_empty_principles();
+        let output = temper(agent, &config, "test");
+        assert!(output.contains("fetch"), "missing fetch keyword");
+        assert!(output.contains("brief"), "missing brief artifact type");
+        assert!(output.contains("Context (fetch these before starting)"), "missing context section");
+    }
+
+    #[test]
+    fn test_temper_arm_no_fetch_instructions() {
+        let agents = load_agents("test");
+        let agent = agents.get("arm").unwrap();
+        let config = test_config_empty_principles();
+        let output = temper(agent, &config, "test");
+        assert!(!output.contains("Context (fetch"), "arm should not have Context (fetch section");
+    }
+
+    #[test]
+    fn test_temper_breakdown_has_two_fetches() {
+        let agents = load_agents("test");
+        let agent = agents.get("breakdown").unwrap();
+        let config = test_config_empty_principles();
+        let output = temper(agent, &config, "test");
+        assert!(output.contains("\"brief\""), "missing brief fetch instruction");
+        assert!(output.contains("\"design\""), "missing design fetch instruction");
     }
 }

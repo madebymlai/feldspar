@@ -362,6 +362,10 @@ fn temper_tool_def() -> Value {
                     "type": "string",
                     "enum": ["arm", "solve", "breakdown", "build", "bugfest", "ar", "pmatch"],
                     "description": "Agent role to activate"
+                },
+                "prefix": {
+                    "type": "string",
+                    "description": "Reuse prefix from previous workflow step. If omitted, generates new."
                 }
             },
             "required": ["role"]
@@ -480,6 +484,90 @@ fn configure_tool_def() -> Value {
             "required": ["action", "level"]
         }
     })
+}
+
+fn artifact_type_to_mode(artifact_type: &str) -> Option<&str> {
+    match artifact_type {
+        "brief" => Some("brainstorming"),
+        "design" => Some("problem-solving"),
+        "execution_plan" => Some("planning"),
+        "diagnosis" => Some("debugging"),
+        "validation_report" => Some("pattern-matching"),
+        _ => None,
+    }
+}
+
+fn fetch_tool_def() -> Value {
+    json!({
+        "name": "fetch",
+        "description": "Read a previously submitted artifact by prefix and type.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prefix": { "type": "string", "description": "Workflow prefix" },
+                "type": {
+                    "type": "string",
+                    "enum": ["brief", "design", "execution_plan", "diagnosis", "validation_report"],
+                    "description": "Artifact type to fetch"
+                }
+            },
+            "required": ["prefix", "type"]
+        }
+    })
+}
+
+async fn handle_fetch(state: &McpState, headers: &HeaderMap, id: Value, params: Option<Value>) -> Value {
+    let session_id = match validate_session(state, headers).await {
+        Ok(id) => id,
+        Err(_) => return jsonrpc_error(Some(id), -32602, "No valid session"),
+    };
+    let sessions = state.sessions.read().await;
+    if !sessions.get(&session_id).map(|s| s.prefix.is_some()).unwrap_or(false) {
+        return jsonrpc_error(Some(id), -32602, "Must call temper first");
+    }
+    drop(sessions);
+
+    let arguments = params.as_ref().and_then(|p| p.get("arguments")).cloned().unwrap_or_default();
+    let prefix = arguments.get("prefix").and_then(|p| p.as_str()).unwrap_or("");
+    let artifact_type = arguments.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    if prefix.is_empty() || artifact_type.is_empty() {
+        return jsonrpc_error(Some(id), -32602, "Missing prefix or type");
+    }
+
+    let mode = match artifact_type_to_mode(artifact_type) {
+        Some(m) => m,
+        None => return jsonrpc_error(Some(id), -32602, &format!("Unknown artifact type: {}", artifact_type)),
+    };
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "default".into());
+    let dir = std::path::PathBuf::from(home)
+        .join(".feldspar/data")
+        .join(&project)
+        .join("artifacts")
+        .join(mode);
+
+    let pattern = format!("{}-", prefix);
+    let content = std::fs::read_dir(&dir)
+        .ok()
+        .and_then(|entries| {
+            entries.flatten()
+                .find(|e| e.file_name().to_string_lossy().starts_with(&pattern))
+                .and_then(|e| std::fs::read_to_string(e.path()).ok())
+        });
+
+    match content {
+        Some(c) => jsonrpc_result(id, json!({
+            "content": [{"type": "text", "text": c}],
+            "isError": false
+        })),
+        None => jsonrpc_error(Some(id), -32602,
+            &format!("Artifact not found: prefix={}, type={}", prefix, artifact_type)),
+    }
 }
 
 fn resolve_config_dir(project_name: &str, level: &str) -> std::path::PathBuf {
@@ -769,6 +857,7 @@ fn handle_tools_list(is_teammate: bool, has_prefix: bool, is_ar_gated: bool, id:
         tools.push(temper_tool_def());
         if has_prefix {
             tools.push(submit_tool_def());
+            tools.push(fetch_tool_def());
             if is_ar_gated {
                 tools.push(judge_tool_def());
             }
@@ -799,12 +888,15 @@ async fn handle_tools_call(state: &McpState, headers: &HeaderMap, id: Value, par
             }
             match state.agents.get(role) {
                 Some(agent) => {
-                    let prefix = loop {
-                        let candidate = agents::generate_prefix();
-                        let sessions = state.sessions.read().await;
-                        let taken = sessions.values().any(|s| s.prefix.as_deref() == Some(&candidate));
-                        drop(sessions);
-                        if !taken { break candidate; }
+                    let prefix = match arguments.get("prefix").and_then(|p| p.as_str()) {
+                        Some(p) if !p.is_empty() => p.to_owned(),
+                        _ => loop {
+                            let candidate = agents::generate_prefix();
+                            let sessions = state.sessions.read().await;
+                            let taken = sessions.values().any(|s| s.prefix.as_deref() == Some(&candidate));
+                            drop(sessions);
+                            if !taken { break candidate; }
+                        },
                     };
                     let prompt = agents::temper(agent, &state.server.config, &prefix);
 
@@ -831,6 +923,7 @@ async fn handle_tools_call(state: &McpState, headers: &HeaderMap, id: Value, par
         }
         "configure" => handle_configure(state, id, &params),
         "submit" => handle_submit(state, headers, id, Some(params)).await,
+        "fetch" => handle_fetch(state, headers, id, Some(params)).await,
         "judge" => handle_judge(state, headers, id, Some(params)).await,
         "sequentialthinking" => {
             let arguments = match params.get("arguments") {
@@ -892,6 +985,15 @@ async fn handle_submit(state: &McpState, headers: &HeaderMap, id: Value, params:
 
     if name.is_empty() || content.is_empty() {
         return jsonrpc_error(Some(id), -32602, "Missing name or content");
+    }
+
+    let artifact_type = state.agents.values()
+        .find(|a| a.thinking_mode == mode)
+        .map(|a| a.artifact_type.as_str())
+        .unwrap_or("unknown");
+
+    if let Err(e) = crate::schemas::validate(artifact_type, content) {
+        return jsonrpc_error(Some(id), -32602, &e);
     }
 
     let artifact_name = format!("{}-{}", prefix, name);
@@ -1380,40 +1482,33 @@ mod tests {
 
     #[test]
     fn test_tools_list_teammate_with_prefix_ar_gated() {
-        // is_teammate=true, has_prefix=true, ar_gated=true → submit + judge
+        // is_teammate=true, has_prefix=true, ar_gated=true → submit + fetch + judge
         let result = handle_tools_list(true, true, true, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"sequentialthinking"));
         assert!(names.contains(&"temper"));
         assert!(names.contains(&"submit"));
+        assert!(names.contains(&"fetch"));
         assert!(names.contains(&"judge"));
     }
 
     #[test]
     fn test_tools_list_teammate_with_prefix_not_ar_gated() {
-        // is_teammate=true, has_prefix=true, ar_gated=false → submit only, no judge
+        // is_teammate=true, has_prefix=true, ar_gated=false → submit + fetch, no judge
         let result = handle_tools_list(true, true, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"submit"));
+        assert!(names.contains(&"fetch"));
         assert!(!names.contains(&"judge"));
     }
 
-    #[tokio::test]
-    async fn test_tools_list_teammate() {
-        // With CLAUDE_CODE_TEAM_NAME → teammate sees temper, not configure
-        unsafe { std::env::set_var("CLAUDE_CODE_TEAM_NAME", "test-team"); }
-        let (app, session_id) = initialized_app().await;
-        let resp = post_mcp_with_session(
-            app,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
-            &session_id,
-        )
-        .await;
-        unsafe { std::env::remove_var("CLAUDE_CODE_TEAM_NAME"); }
-        let body = body_json(resp).await;
-        let tools = body["result"]["tools"].as_array().unwrap();
+    #[test]
+    fn test_tools_list_teammate() {
+        // With is_teammate=true and no prefix → temper only (no configure, no submit)
+        let result = handle_tools_list(true, false, false, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"temper"), "temper not in teammate tools list");
         assert!(!names.contains(&"configure"), "configure should not be in teammate tools list");
@@ -1736,9 +1831,10 @@ mod tests {
         unsafe { std::env::remove_var("CLAUDE_CODE_TEAM_NAME"); }
         let body = body_json(resp).await;
         let tools = body["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"submit"));
+        assert!(names.contains(&"fetch"));
         assert!(names.contains(&"judge"));
     }
 
@@ -2010,5 +2106,232 @@ mod tests {
         let content = std::fs::read_to_string(config_dir.join("feldspar.toml")).unwrap();
         assert!(!content.contains("[modes.data-pipeline]"));
         assert!(!config_dir.join("agents/data-pipeline.toml").exists());
+    }
+
+    // --- Submit validation tests (Task 1) ---
+
+    #[tokio::test]
+    async fn test_submit_valid_brief() {
+        let (app, session_id) = initialized_app().await;
+        // Temper as arm (artifact_type=brief, thinking_mode=brainstorming)
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let valid_brief = r#"
+[[requirements]]
+name = "Auth"
+description = "User authentication"
+user_story = "As a user, I want to log in"
+"#;
+        let body_str = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {"name": "brief", "content": valid_brief}}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &body_str, &session_id).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("stored"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_invalid_brief() {
+        let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let body_str = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {"name": "brief", "content": "garbage content {{ not toml"}}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &body_str, &session_id).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.to_lowercase().contains("schema validation failed") || msg.to_lowercase().contains("brief"), "error: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_submit_build_skips_validation() {
+        let (app, session_id) = initialized_app().await;
+        // build has artifact_type=code → no validation
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            &session_id,
+        ).await;
+        let body_str = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {"name": "impl", "content": "anything at all, not even valid TOML {{ }}"}}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &body_str, &session_id).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "build agent should skip validation: {:?}", body);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("stored"));
+    }
+
+    // --- Temper prefix tests (Task 2) ---
+
+    #[tokio::test]
+    async fn test_temper_with_prefix_reuses() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"solve","prefix":"bf7k"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("PREFIX: bf7k"), "expected PREFIX: bf7k in: {}", &text[..80.min(text.len())]);
+    }
+
+    #[tokio::test]
+    async fn test_temper_without_prefix_generates() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let first_line = text.lines().next().unwrap();
+        assert!(first_line.starts_with("PREFIX: "), "expected PREFIX line");
+        let generated = first_line.strip_prefix("PREFIX: ").unwrap();
+        assert_eq!(generated.len(), 4, "generated prefix should be 4 chars");
+    }
+
+    #[tokio::test]
+    async fn test_temper_empty_prefix_generates() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm","prefix":""}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let first_line = text.lines().next().unwrap();
+        let generated = first_line.strip_prefix("PREFIX: ").unwrap();
+        assert_eq!(generated.len(), 4, "empty prefix should generate new 4-char prefix");
+    }
+
+    // --- Tools list: teammate has fetch (Task 4) ---
+
+    #[test]
+    fn test_tools_list_teammate_has_fetch() {
+        let result = handle_tools_list(true, true, false, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"fetch"), "fetch not in tempered teammate tools");
+    }
+
+    #[test]
+    fn test_tools_list_orchestrator_no_fetch() {
+        let result = handle_tools_list(false, false, false, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(!names.contains(&"fetch"), "fetch must not appear in orchestrator tools");
+    }
+
+    // --- Fetch tool tests (Task 3) ---
+
+    #[tokio::test]
+    async fn test_fetch_existing_artifact() {
+        let (app, session_id) = initialized_app().await;
+
+        // Temper as arm to get a prefix
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let prefix = text.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap().to_owned();
+
+        // Submit a valid brief
+        let valid_brief = "[[requirements]]\nname = \"X\"\ndescription = \"Y\"\nuser_story = \"Z\"\n";
+        let submit_body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {"name": "brief", "content": valid_brief}}
+        })).unwrap();
+        post_mcp_with_session(app.clone(), &submit_body, &session_id).await;
+
+        // Temper as solve with same prefix to get access
+        let temper2 = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": {"name": "temper", "arguments": {"role": "solve", "prefix": prefix}}
+        })).unwrap();
+        post_mcp_with_session(app.clone(), &temper2, &session_id).await;
+
+        // Fetch the brief
+        let fetch_body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": {"name": "fetch", "arguments": {"prefix": prefix, "type": "brief"}}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &fetch_body, &session_id).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        let returned = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(returned.contains("requirements"), "expected brief content: {}", returned);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_not_found() {
+        let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fetch","arguments":{"prefix":"zzzz","type":"brief"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("not found"), "expected not found in: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_unknown_type() {
+        let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fetch","arguments":{"prefix":"test","type":"bad"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("Unknown artifact type"), "expected unknown type error: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_without_temper() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fetch","arguments":{"prefix":"test","type":"brief"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("temper"), "expected temper error: {}", msg);
     }
 }

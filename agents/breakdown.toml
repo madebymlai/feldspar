@@ -5,6 +5,7 @@ interactive = "background"
 team = true
 ar_gated = true
 thinking_mode = "planning"
+fetches = ["brief", "design"]
 
 [prompt]
 identity = """
@@ -15,8 +16,13 @@ Each task must be independently verifiable and small enough to implement in one 
 instructions = """
 Cover all components touched by the design — don't skip anything.
 Scope each task atomically: one concern, one outcome, clear acceptance criteria.
-Sequence tasks by dependency: nothing starts before its blockers are done.
+Group tasks by file ownership — no two groups touch the same file.
+Sequence groups by dependency. Tasks within a group are sequential.
 Don't skip steps to appear faster. A missing step is a future bug.
+When done, report the group dependency graph in your completion message:
+  Groups: N
+  Group 1: tasks [1,2,3], depends_on []
+  Group 2: tasks [4,5], depends_on [1]
 """
 
 [warnings]

@@ -5,6 +5,7 @@ interactive = "background"
 team = false
 ar_gated = false
 thinking_mode = "n/a"
+fetches = []
 
 [prompt]
 identity = """

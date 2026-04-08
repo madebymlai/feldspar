@@ -5,6 +5,7 @@ interactive = "background"
 team = true
 ar_gated = false
 thinking_mode = "pattern-matching"
+fetches = []
 
 [prompt]
 identity = """

@@ -5,6 +5,7 @@ interactive = "panel"
 team = true
 ar_gated = false
 thinking_mode = "brainstorming"
+fetches = []
 
 [prompt]
 identity = """

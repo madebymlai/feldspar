@@ -1,6 +1,7 @@
 mod agents;
 mod analyzers;
 mod ar;
+mod schemas;
 mod config;
 mod db;
 mod init;
