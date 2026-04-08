@@ -4,8 +4,7 @@ use std::process::Command;
 const DEFAULT_FELDSPAR_TOML: &str = include_str!("../config/feldspar.toml");
 const DEFAULT_PRINCIPLES_TOML: &str = include_str!("../config/principles.toml");
 
-const FS_SKILL_MD: &str = include_str!("../skills/fs/SKILL.md");
-const FS_CONFIG_MD: &str = include_str!("../skills/fs/config.md");
+const FS_CONFIG_SKILL_MD: &str = include_str!("../skills/fs-config/SKILL.md");
 
 pub fn detect_project_name(override_name: Option<&str>) -> String {
     if let Some(name) = override_name {
@@ -77,8 +76,11 @@ pub fn run_init(project_name: &str, project_dir: &Path, api_key: &str) -> Result
     write_hooks_settings(project_dir)?;
     write_skill_files(project_dir)?;
 
-    // Tmux setup (best-effort, non-blocking)
-    run_tmux_setup();
+    // Set teammateMode: "tmux" in ~/.claude.json (best-effort)
+    write_teammate_mode();
+
+    // Ensure tmux mouse support is enabled (best-effort)
+    write_tmux_mouse();
 
     println!(
         "\nfeldspar initialized for project '{}'.\n\
@@ -133,8 +135,7 @@ fn write_mcp_json(project_dir: &Path, project_name: &str, api_key: &str) -> Resu
             "command": "feldspar",
             "args": ["start", "--project", project_name],
             "env": {
-                "OPENROUTER_API_KEY": api_key,
-                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+                "OPENROUTER_API_KEY": api_key
             }
         }),
     );
@@ -157,6 +158,17 @@ fn write_hooks_settings(project_dir: &Path) -> Result<(), String> {
     } else {
         json!({})
     };
+
+    // Enable agent teams
+    let env = settings
+        .as_object_mut()
+        .unwrap()
+        .entry("env")
+        .or_insert_with(|| json!({}));
+    env.as_object_mut()
+        .unwrap()
+        .entry("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+        .or_insert_with(|| json!("1"));
 
     let hooks = settings
         .as_object_mut()
@@ -197,25 +209,56 @@ fn write_hooks_settings(project_dir: &Path) -> Result<(), String> {
 }
 
 fn write_skill_files(project_dir: &Path) -> Result<(), String> {
-    let skills_dir = project_dir.join(".claude/skills/fs");
-    std::fs::create_dir_all(&skills_dir)
-        .map_err(|e| format!("failed to create skills/fs dir: {}", e))?;
-
-    std::fs::write(skills_dir.join("SKILL.md"), FS_SKILL_MD)
-        .map_err(|e| format!("failed to write SKILL.md: {}", e))?;
-    std::fs::write(skills_dir.join("config.md"), FS_CONFIG_MD)
-        .map_err(|e| format!("failed to write config.md: {}", e))?;
+    let config_dir = project_dir.join(".claude/skills/fs-config");
+    std::fs::create_dir_all(&config_dir)
+        .map_err(|e| format!("failed to create skills/fs-config dir: {}", e))?;
+    std::fs::write(config_dir.join("SKILL.md"), FS_CONFIG_SKILL_MD)
+        .map_err(|e| format!("failed to write fs-config SKILL.md: {}", e))?;
 
     Ok(())
 }
 
-fn run_tmux_setup() {
-    let script = std::path::Path::new("scripts/setup-tmux.sh");
-    if script.exists() {
-        let _ = std::process::Command::new("bash")
-            .arg(script)
-            .status();
+fn write_teammate_mode() {
+    use serde_json::{json, Value};
+
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let claude_json_path = home.join(".claude.json");
+
+    let mut config: Value = if claude_json_path.exists() {
+        std::fs::read_to_string(&claude_json_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({}))
+    } else {
+        json!({})
+    };
+
+    let obj = config.as_object_mut().unwrap();
+    if obj.get("teammateMode").and_then(|v| v.as_str()) == Some("tmux") {
+        return; // already set
     }
+    obj.insert("teammateMode".into(), json!("tmux"));
+
+    let _ = std::fs::write(&claude_json_path, serde_json::to_string_pretty(&config).unwrap());
+}
+
+fn write_tmux_mouse() {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let tmux_conf = home.join(".tmux.conf");
+    let content = std::fs::read_to_string(&tmux_conf).unwrap_or_default();
+    if content.contains("set -g mouse on") {
+        return; // already set
+    }
+    let updated = if content.is_empty() {
+        "set -g mouse on\n".to_owned()
+    } else {
+        format!("{}\nset -g mouse on\n", content.trim_end())
+    };
+    let _ = std::fs::write(&tmux_conf, updated);
 }
 
 #[cfg(test)]
@@ -256,7 +299,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(v["mcpServers"]["feldspar"].is_object());
         assert_eq!(v["mcpServers"]["feldspar"]["args"][2], "my-proj");
-        assert_eq!(v["mcpServers"]["feldspar"]["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1");
+        assert!(v["mcpServers"]["feldspar"]["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"].is_null());
     }
 
     #[test]
@@ -282,6 +325,20 @@ mod tests {
     }
 
     #[test]
+    fn test_write_teammate_mode() {
+        let tmp = TempDir::new().unwrap();
+        let claude_json = tmp.path().join(".claude.json");
+
+        // Simulate write_teammate_mode logic with a custom path
+        let config = serde_json::json!({"teammateMode": "tmux"});
+        std::fs::write(&claude_json, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let content = std::fs::read_to_string(&claude_json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["teammateMode"], "tmux");
+    }
+
+    #[test]
     fn test_write_hooks() {
         let tmp = TempDir::new().unwrap();
         write_hooks_settings(tmp.path()).unwrap();
@@ -290,5 +347,6 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(v["hooks"]["SessionStart"].is_array());
         assert!(v["hooks"]["PostToolUse"].is_array());
+        assert_eq!(v["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1");
     }
 }

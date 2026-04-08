@@ -3,9 +3,9 @@ use crate::ar::ArEngine;
 use crate::thought::{ThinkingServer, ThoughtInput, Timestamp};
 use axum::{
     Router,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::IntoResponse,
+    response::{IntoResponse, Redirect},
     routing::{delete, get, post},
     Json,
 };
@@ -24,6 +24,8 @@ pub struct McpState {
     pub agents: HashMap<String, AgentDef>,
     pub ar: Option<ArEngine>,
     pub project_name: String,
+    pub port: u16,
+    pub oauth_codes: RwLock<HashMap<String, String>>,
 }
 
 pub struct Session {
@@ -38,13 +40,15 @@ pub struct Session {
 }
 
 impl McpState {
-    pub fn new(server: ThinkingServer, agents: HashMap<String, AgentDef>, ar: Option<ArEngine>, project_name: String) -> Self {
+    pub fn new(server: ThinkingServer, agents: HashMap<String, AgentDef>, ar: Option<ArEngine>, project_name: String, port: u16) -> Self {
         Self {
             server,
             sessions: RwLock::new(HashMap::new()),
             agents,
             ar,
             project_name,
+            port,
+            oauth_codes: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -62,7 +66,103 @@ pub fn create_router(state: Arc<McpState>) -> Router {
         .route("/mcp", post(handle_post))
         .route("/mcp", get(handle_get))
         .route("/mcp", delete(handle_delete))
+        .route("/.well-known/oauth-protected-resource", get(handle_oauth_protected_resource))
+        .route("/.well-known/oauth-authorization-server", get(handle_oauth_metadata))
+        .route("/oauth/authorize", get(handle_oauth_authorize))
+        .route("/oauth/token", post(handle_oauth_token))
+        .route("/oauth/register", post(handle_oauth_register))
+        .fallback(handle_fallback)
         .with_state(state)
+}
+
+async fn handle_fallback() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(json!({"error": "not_found"})),
+    )
+}
+
+// --- OAuth endpoints (auto-approve for local dev) ---
+
+fn oauth_base_url(headers: &HeaderMap, default_port: u16) -> String {
+    if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        format!("http://{}", host)
+    } else {
+        format!("http://localhost:{}", default_port)
+    }
+}
+
+async fn handle_oauth_protected_resource(headers: HeaderMap, State(state): State<Arc<McpState>>) -> Json<Value> {
+    let base = oauth_base_url(&headers, state.port);
+    Json(json!({
+        "resource": base,
+        "authorization_servers": [base],
+        "bearer_methods_supported": ["header"]
+    }))
+}
+
+async fn handle_oauth_metadata(headers: HeaderMap, State(state): State<Arc<McpState>>) -> Json<Value> {
+    let base = oauth_base_url(&headers, state.port);
+    Json(json!({
+        "issuer": base,
+        "authorization_endpoint": format!("{}/oauth/authorize", base),
+        "token_endpoint": format!("{}/oauth/token", base),
+        "registration_endpoint": format!("{}/oauth/register", base),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"]
+    }))
+}
+
+async fn handle_oauth_register(Json(body): Json<Value>) -> Json<Value> {
+    let redirect_uris = body.get("redirect_uris").cloned().unwrap_or(json!([]));
+    let client_name = body.get("client_name").and_then(|v| v.as_str()).unwrap_or("claude-code");
+    Json(json!({
+        "client_id": format!("feldspar-{}", uuid::Uuid::new_v4()),
+        "client_secret": format!("secret-{}", uuid::Uuid::new_v4()),
+        "client_id_issued_at": now_millis() / 1000,
+        "client_secret_expires_at": 0,
+        "redirect_uris": redirect_uris,
+        "client_name": client_name,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "client_secret_post"
+    }))
+}
+
+async fn handle_oauth_authorize(
+    State(state): State<Arc<McpState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let redirect_uri = match params.get("redirect_uri") {
+        Some(uri) => uri.clone(),
+        None => return Redirect::temporary("/").into_response(),
+    };
+    let code = uuid::Uuid::new_v4().to_string();
+    // Store the code for exchange
+    state.oauth_codes.write().await.insert(code.clone(), "approved".to_string());
+    let state_param = params.get("state").cloned().unwrap_or_default();
+    let sep = if redirect_uri.contains('?') { "&" } else { "?" };
+    let url = format!("{}{}code={}&state={}", redirect_uri, sep, code, state_param);
+    Redirect::temporary(&url).into_response()
+}
+
+async fn handle_oauth_token(
+    State(state): State<Arc<McpState>>,
+    axum::Form(params): axum::Form<HashMap<String, String>>,
+) -> Json<Value> {
+    // Accept any code or refresh token
+    if let Some(code) = params.get("code") {
+        state.oauth_codes.write().await.remove(code);
+    }
+    Json(json!({
+        "access_token": format!("feldspar-{}", uuid::Uuid::new_v4()),
+        "token_type": "Bearer",
+        "expires_in": 86400,
+        "refresh_token": format!("refresh-{}", uuid::Uuid::new_v4())
+    }))
 }
 
 pub async fn session_cleanup_task(state: Arc<McpState>) {
@@ -1209,7 +1309,7 @@ mod tests {
             None,
         );
         let agent_defs = crate::agents::load_agents("test");
-        let state = Arc::new(McpState::new(server, agent_defs, None, "test".into()));
+        let state = Arc::new(McpState::new(server, agent_defs, None, "test".into(), 0));
         create_router(state)
     }
 
