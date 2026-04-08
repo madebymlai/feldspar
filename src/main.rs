@@ -72,35 +72,70 @@ async fn run_server(port: u16) {
     let db = db::Db::open(&config.feldspar.db_path).await;
     let db = db.map(Arc::new);
 
-    // Leaf cache + ML startup from DB history
+    // Leaf cache: populate from DB history
     let leaf_cache = Arc::new(RwLock::new(HashMap::new()));
     if let Some(ref db) = db {
-        let _traces = db.load_traces().await;
-        // ml.bulk_train(traces) — wired when ML is implemented
-
         for entry in db.load_leaf_nodes().await {
             leaf_cache.write().await.insert(entry.trace_id, entry.leaf_nodes);
         }
     }
 
-    let server = thought::ThinkingServer::new(config, llm, db.clone(), leaf_cache);
+    // Build mode_map from config (sorted for stable index assignment)
+    let mut mode_names: Vec<String> = config.modes.keys().cloned().collect();
+    mode_names.sort();
+    let mode_map: HashMap<String, usize> = mode_names
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| (m, i))
+        .collect();
+
+    // ML startup — load from file, disaster-recover from DB, or cold start
+    let db_dir = std::path::Path::new(&config.feldspar.db_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let model_path = db_dir.join("model.bin");
+
+    let ml_loaded = ml::MlEngine::load(&model_path, mode_map.clone(), config.feldspar.ml_budget);
+    let ml = if ml_loaded.is_none() {
+        if let Some(ref db_ref) = db {
+            let matrix = db_ref.load_feature_matrix().await;
+            if matrix.is_empty() {
+                tracing::warn!("no feature vectors in DB for disaster recovery");
+                None
+            } else {
+                tracing::info!(traces = matrix.len(), "disaster recovery: training from DB");
+                ml::MlEngine::disaster_recover(
+                    &matrix,
+                    mode_map.clone(),
+                    model_path.clone(),
+                    config.feldspar.ml_budget,
+                )
+            }
+        } else {
+            None
+        }
+    } else {
+        ml_loaded
+    };
+    let ml = ml.map(Arc::new);
+
+    let leaf_cache_for_prune = leaf_cache.clone();
+    let server = thought::ThinkingServer::new(config, llm, db.clone(), leaf_cache, ml.clone());
     let state = Arc::new(mcp::McpState::new(server));
 
     let cleanup_state = state.clone();
     tokio::spawn(mcp::session_cleanup_task(cleanup_state));
 
     // Prune timer — every 30 minutes
-    if let Some(ref db) = db {
+    if let (Some(db), Some(ml)) = (&db, &ml) {
         let db_clone = db.clone();
+        let ml_clone = ml.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
             interval.tick().await; // skip immediate first tick
             loop {
                 interval.tick().await;
-                // let ids = ml.identify_low_value_traces();
-                // db_clone.prune(&ids).await;
-                // evict from leaf_cache
-                let _ = &db_clone; // keep alive until ML wires in
+                thought::run_prune(&ml_clone, &db_clone, &leaf_cache_for_prune).await;
             }
         });
     }
@@ -117,6 +152,12 @@ async fn run_server(port: u16) {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
+
+    // Shutdown: flush remaining training buffer + save model
+    if let Some(ref ml) = ml {
+        ml.flush_buffer();
+        let _ = ml.save();
+    }
 
     info!("feldspar shutdown complete");
 }

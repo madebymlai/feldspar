@@ -24,9 +24,15 @@ pub struct FeldsparConfig {
     pub recap_every: u32,
     #[serde(default = "default_top_k")]
     pub pattern_recall_top_k: u32,
+    #[serde(default = "default_ml_budget")]
+    pub ml_budget: f64,
+    #[serde(default = "default_pattern_recall_min_traces")]
+    pub pattern_recall_min_traces: u32,
 }
 
 fn default_top_k() -> u32 { 3 }
+fn default_ml_budget() -> f64 { 0.5 }
+fn default_pattern_recall_min_traces() -> u32 { 10 }
 
 #[derive(Debug, Deserialize)]
 pub struct LlmConfig {
@@ -192,6 +198,8 @@ mod tests {
                 model_path: "test.model".into(),
                 recap_every: 3,
                 pattern_recall_top_k: 3,
+                ml_budget: 0.5,
+                pattern_recall_min_traces: 10,
             },
             llm: LlmConfig {
                 base_url: None,
@@ -480,5 +488,62 @@ valid = []
 "#;
         let config: Config = toml::from_str(toml).expect("should parse");
         assert_eq!(config.feldspar.pattern_recall_top_k, 5);
+    }
+
+    fn minimal_feldspar_toml() -> &'static str {
+        r#"
+[feldspar]
+db_path = "test.db"
+model_path = "test.model"
+recap_every = 3
+
+[llm]
+model = "test-model"
+
+[thresholds]
+confidence_gap = 25.0
+over_analysis_multiplier = 1.5
+overthinking_multiplier = 2.0
+
+[budgets]
+standard = [3, 5]
+
+[modes]
+
+[components]
+valid = []
+"#
+    }
+
+    #[test]
+    fn test_ml_budget_default() {
+        let config: Config = toml::from_str(minimal_feldspar_toml()).expect("should parse");
+        assert!((config.feldspar.ml_budget - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ml_budget_custom() {
+        let toml = minimal_feldspar_toml().replace(
+            "recap_every = 3",
+            "recap_every = 3\nml_budget = 1.0",
+        );
+        let config: Config = toml::from_str(&toml).expect("should parse");
+        assert!((config.feldspar.ml_budget - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pattern_recall_min_traces_default() {
+        let config: Config = toml::from_str(minimal_feldspar_toml()).expect("should parse");
+        assert_eq!(config.feldspar.pattern_recall_min_traces, 10);
+    }
+
+    #[test]
+    fn test_pattern_recall_min_traces_custom() {
+        let toml = minimal_feldspar_toml().replace(
+            "recap_every = 3",
+            "recap_every = 3\npattern_recall_min_traces = 20",
+        );
+        let config: Config = toml::from_str(&toml).expect("should parse");
+        assert_eq!(config.feldspar.pattern_recall_min_traces, 20);
     }
 }

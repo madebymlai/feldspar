@@ -266,6 +266,8 @@ mod tests {
                 model_path: "test.model".into(),
                 recap_every: 3,
                 pattern_recall_top_k: 3,
+                ml_budget: 0.5,
+                pattern_recall_min_traces: 10,
             },
             llm: LlmConfig {
                 base_url: None,

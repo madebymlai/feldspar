@@ -160,13 +160,11 @@ impl Trace {
     }
 }
 
-pub struct MlModel;
-
 pub struct ThinkingServer {
     pub traces: RwLock<HashMap<String, Trace>>,
     pub config: Arc<Config>,
     pub db: Option<Arc<crate::db::Db>>,
-    pub ml: Option<MlModel>,
+    pub ml: Option<Arc<crate::ml::MlEngine>>,
     pub llm: Option<LlmClient>,
     pub leaf_cache: Arc<RwLock<HashMap<String, Vec<usize>>>>,
 }
@@ -177,12 +175,13 @@ impl ThinkingServer {
         llm: Option<LlmClient>,
         db: Option<Arc<crate::db::Db>>,
         leaf_cache: Arc<RwLock<HashMap<String, Vec<usize>>>>,
+        ml: Option<Arc<crate::ml::MlEngine>>,
     ) -> Self {
         Self {
             traces: RwLock::new(HashMap::new()),
             config,
             db,
-            ml: None,
+            ml,
             llm,
             leaf_cache,
         }
@@ -313,12 +312,12 @@ impl ThinkingServer {
 
         // Prune on session start (thought 1)
         if input.thought_number == 1 {
-            if let Some(ref db) = self.db {
-                let _db = db.clone();
-                let _cache = self.leaf_cache.clone();
+            if let (Some(db), Some(ml)) = (&self.db, &self.ml) {
+                let db = db.clone();
+                let ml = ml.clone();
+                let cache = self.leaf_cache.clone();
                 tokio::spawn(async move {
-                    // ml.identify_low_value_traces → db.prune → cache evict
-                    // Wired when ML is implemented
+                    run_prune(&ml, &db, &cache).await;
                 });
             }
         }
@@ -366,6 +365,19 @@ impl ThinkingServer {
         if let Some(trace) = removed_trace {
             let trace = Arc::new(trace);
 
+            // Compute features before flush (needs full trace for snapshot)
+            let features_for_ml = if let Some(ref ml) = self.ml {
+                let ml_snap = build_trace_snapshot(&trace);
+                let last_input = trace.thoughts.last().map(|r| &r.input).unwrap_or(&input);
+                let features = crate::ml::MlEngine::extract_features(last_input, &ml_snap, &ml.mode_map);
+                Some(features)
+            } else {
+                None
+            };
+            let features_blob = features_for_ml.as_ref().and_then(|f|
+                bincode::encode_to_vec(f, bincode::config::standard()).ok()
+            );
+
             // 1. Flush trace — AWAITED, must complete before UPDATE tasks
             if let Some(ref db) = self.db {
                 let components: Vec<String> = trace.thoughts.iter()
@@ -375,30 +387,79 @@ impl ThinkingServer {
                     &snapshot.trace_id,
                     input.thinking_mode.as_deref(),
                     &components,
+                    features_blob.as_deref(),
                     trace.created_at,
                 ).await;
             }
 
-            // 2. ML train (spawned)
-            let t2 = trace.clone();
-            tokio::spawn(async move {
-                let _ = &t2; // ml.train — no-op until ML implemented
-            });
+            // 2. ML train (spawned — fires when trust score is available)
+            if let Some(trust) = trust_score {
+                if let (Some(ml), Some(features)) = (&self.ml, &features_for_ml) {
+                    let ml = ml.clone();
+                    let features = features.clone();
+                    tokio::spawn(async move {
+                        ml.train(features, trust);
+                    });
+                }
+            }
 
             // 3. ML compute leaf nodes + update cache (spawned)
-            if let Some(ref db) = self.db {
-                let _db = db.clone();
-                let _trace_id = snapshot.trace_id.clone();
-                let _cache = self.leaf_cache.clone();
+            if let (Some(ml), Some(features)) = (&self.ml, features_for_ml) {
+                let ml = ml.clone();
+                let db = self.db.clone();
+                let trace_id = snapshot.trace_id.clone();
+                let cache = self.leaf_cache.clone();
                 tokio::spawn(async move {
-                    let _ = &trace;
-                    // ml.predict_nodes → db.store_leaf_nodes → cache.write().insert()
-                    // Wired when ML is implemented
+                    if let Some(flat_leaves) = ml.predict_nodes(&features) {
+                        if let Some(ref db) = db {
+                            db.store_leaf_nodes(&trace_id, &flat_leaves).await;
+                        }
+                        cache.write().await.insert(trace_id, flat_leaves);
+                    }
                 });
             }
         }
 
         let pipeline = run_pipeline(&input, &snapshot.branch_records, &self.config);
+
+        // ML predict + drift (hot path — sync, microseconds)
+        let (ml_trajectory, ml_drift) = if let Some(ref ml) = self.ml {
+            let ml_snap = build_ml_snapshot_from_phase2(&input, &snapshot, &pipeline);
+            let features = crate::ml::MlEngine::extract_features(&input, &ml_snap, &ml.mode_map);
+            let trajectory = ml.predict(&features);
+            let drift_report = ml.drift(&features);
+            (trajectory, Some(drift_report.data_drift || drift_report.concept_drift))
+        } else {
+            (None, None)
+        };
+
+        // Pattern recall (thought 1 only)
+        let pattern_recall = if input.thought_number == 1 {
+            if let Some(ref ml) = self.ml {
+                let sync_cache: Option<HashMap<String, Vec<usize>>> = {
+                    let cache = self.leaf_cache.read().await;
+                    if cache.len() >= self.config.feldspar.pattern_recall_min_traces as usize {
+                        Some(cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(sync_cache) = sync_cache {
+                    let ml_snap = build_ml_snapshot_from_phase2(&input, &snapshot, &pipeline);
+                    let features = crate::ml::MlEngine::extract_features(&input, &ml_snap, &ml.mode_map);
+                    let ids = ml.find_similar(
+                        &features,
+                        &sync_cache,
+                        self.config.feldspar.pattern_recall_top_k as usize,
+                    );
+                    if !ids.is_empty() {
+                        if let Some(ref db) = self.db {
+                            Some(db.find_traces_by_ids(&ids).await)
+                        } else { None }
+                    } else { None }
+                } else { None }
+            } else { None }
+        } else { None };
 
         let mut warnings = generate_warnings(&input, &snapshot.recent_progress, &self.config);
         warnings.extend(pipeline.panic_warnings);
@@ -449,13 +510,13 @@ impl ThinkingServer {
             budget_used: snapshot.budget_used,
             budget_max: snapshot.budget_max,
             budget_category: snapshot.budget_category,
-            trajectory: None,
-            drift_detected: None,
+            trajectory: ml_trajectory,
+            drift_detected: ml_drift,
             recap,
             adr,
             trust_score,
             trust_reason,
-            pattern_recall: None, // Populated when ML implements find_similar
+            pattern_recall,
         })
     }
 
@@ -469,6 +530,173 @@ impl ThinkingServer {
 const RECAP_SYSTEM_PROMPT: &str = "You summarize thinking traces. Given numbered thoughts, \
     produce a 1-2 sentence recap capturing the key progression and current conclusion. \
     Respond with ONLY a JSON object: {\"recap\": \"<your summary>\"}";
+
+/// Build ML TraceSnapshot from the phase-2 local snapshot + pipeline output.
+/// Used for hot-path predict/drift. Fields not available without full trace history
+/// are set to NaN (handled correctly by extract_features).
+fn build_ml_snapshot_from_phase2(
+    _input: &ThoughtInput,
+    snapshot: &TraceSnapshot,
+    pipeline: &crate::analyzers::PipelineResult,
+) -> crate::ml::TraceSnapshot {
+    let branch_inputs = &snapshot.branch_records;
+    let confidences: Vec<f64> = branch_inputs.iter().filter_map(|t| t.confidence).collect();
+    let avg_confidence = if confidences.is_empty() {
+        f64::NAN
+    } else {
+        confidences.iter().sum::<f64>() / confidences.len() as f64
+    };
+
+    crate::ml::TraceSnapshot {
+        thought_count: snapshot.thought_history_length as u32,
+        avg_confidence,
+        avg_confidence_gap: f64::NAN,
+        avg_prior_depth: f64::NAN,
+        current_depth_overlap: pipeline.observations.prev_overlap.unwrap_or(0.0),
+        branch_count: snapshot.branches.len(),
+        revision_count: branch_inputs.iter().filter(|t| t.is_revision).count(),
+        budget_used: snapshot.budget_used,
+        budget_max: snapshot.budget_max,
+        prior_warning_count: 0,
+        warning_responsiveness_ratio: f64::NAN,
+        confidence_convergence: f64::NAN,
+    }
+}
+
+/// Build ML TraceSnapshot from a completed Trace.
+/// Used for train/leaf-node spawns on trace completion.
+/// ThoughtRecord.result is always default (not persisted), so gap/depth fields
+/// will be NaN — the ML model handles undefined features gracefully.
+fn build_trace_snapshot(trace: &Trace) -> crate::ml::TraceSnapshot {
+    let thoughts = &trace.thoughts;
+    let n = thoughts.len() as u32;
+
+    let confidences: Vec<f64> = thoughts.iter().filter_map(|t| t.input.confidence).collect();
+    let avg_confidence = if confidences.is_empty() {
+        f64::NAN
+    } else {
+        confidences.iter().sum::<f64>() / confidences.len() as f64
+    };
+
+    // These depend on stored ThoughtResult fields (always None — not persisted).
+    let gaps: Vec<f64> = thoughts
+        .iter()
+        .filter_map(|t| {
+            let reported = t.input.confidence?;
+            let calculated = t.result.confidence_calculated?;
+            Some((reported - calculated).abs())
+        })
+        .collect();
+    let avg_confidence_gap = if gaps.is_empty() {
+        f64::NAN
+    } else {
+        gaps.iter().sum::<f64>() / gaps.len() as f64
+    };
+    let confidence_convergence = if gaps.len() >= 3 {
+        let last3 = &gaps[gaps.len() - 3..];
+        let mean = last3.iter().sum::<f64>() / 3.0;
+        let variance = last3.iter().map(|g| (g - mean).powi(2)).sum::<f64>() / 3.0;
+        variance.sqrt()
+    } else {
+        f64::NAN
+    };
+
+    let depth_overlaps: Vec<f64> = thoughts.iter().filter_map(|t| t.result.depth_overlap).collect();
+    let avg_prior_depth = if depth_overlaps.len() < 2 {
+        0.0
+    } else {
+        let prior = &depth_overlaps[..depth_overlaps.len() - 1];
+        prior.iter().sum::<f64>() / prior.len() as f64
+    };
+    let current_depth_overlap = depth_overlaps.last().copied().unwrap_or(0.0);
+
+    let branch_count = thoughts
+        .iter()
+        .filter_map(|t| t.input.branch_id.as_ref())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+
+    let warning_responsiveness_ratio = compute_warning_responsiveness(thoughts);
+
+    crate::ml::TraceSnapshot {
+        thought_count: n,
+        avg_confidence,
+        avg_confidence_gap,
+        avg_prior_depth,
+        current_depth_overlap,
+        branch_count,
+        revision_count: thoughts.iter().filter(|t| t.input.is_revision).count(),
+        budget_used: thoughts.len() as u32,
+        budget_max: thoughts.last().map(|t| t.input.total_thoughts).unwrap_or(5),
+        prior_warning_count: thoughts
+            .iter()
+            .take(thoughts.len().saturating_sub(1))
+            .map(|t| t.result.warnings.len())
+            .sum(),
+        warning_responsiveness_ratio,
+        confidence_convergence,
+    }
+}
+
+fn compute_warning_responsiveness(thoughts: &[ThoughtRecord]) -> f64 {
+    let mut warning_thoughts = 0usize;
+    let mut responsive_thoughts = 0usize;
+
+    for i in 0..thoughts.len().saturating_sub(1) {
+        if thoughts[i].result.warnings.is_empty() {
+            continue;
+        }
+        warning_thoughts += 1;
+        let next = &thoughts[i + 1];
+        let curr = &thoughts[i];
+        let confidence_changed = match (curr.input.confidence, next.input.confidence) {
+            (Some(a), Some(b)) => (a - b).abs() > 10.0,
+            _ => false,
+        };
+        let branched = next.input.branch_from_thought.is_some();
+        let revised = next.input.is_revision;
+        let needs_more = next.input.needs_more_thoughts && !curr.input.needs_more_thoughts;
+        if confidence_changed || branched || revised || needs_more {
+            responsive_thoughts += 1;
+        }
+    }
+
+    if warning_thoughts == 0 {
+        f64::NAN
+    } else {
+        responsive_thoughts as f64 / warning_thoughts as f64
+    }
+}
+
+/// Shared prune logic: evict low-value traces from DB + leaf cache.
+/// Called from the 30-min timer in main.rs and from thought-1 spawn.
+pub(crate) async fn run_prune(
+    ml: &Arc<crate::ml::MlEngine>,
+    db: &Arc<crate::db::Db>,
+    leaf_cache: &Arc<RwLock<HashMap<String, Vec<usize>>>>,
+) {
+    let count = db.trace_count_with_trust().await;
+    if count < 100 {
+        return;
+    }
+    let matrix = db.load_feature_matrix().await;
+    if matrix.is_empty() {
+        return;
+    }
+
+    let cache_snapshot: HashMap<String, Vec<usize>> = leaf_cache.read().await.clone();
+    let std_cache = std::sync::RwLock::new(cache_snapshot);
+    let evict_ids = ml.prune_cycle(&matrix, &std_cache);
+
+    if !evict_ids.is_empty() {
+        db.prune(&evict_ids).await;
+        let mut cache = leaf_cache.write().await;
+        for id in &evict_ids {
+            cache.remove(id);
+        }
+    }
+    // v1: skip leaf refresh after prune — stale leaf sets are refreshed on next trace completion.
+}
 
 /// Extracted data from Phase 1 for building WireResponse in Phase 2
 struct TraceSnapshot {
@@ -604,6 +832,8 @@ mod tests {
                 model_path: "test.model".into(),
                 recap_every: 3,
                 pattern_recall_top_k: 3,
+                ml_budget: 0.5,
+                pattern_recall_min_traces: 10,
             },
             llm: crate::config::LlmConfig {
                 base_url: None,
@@ -641,7 +871,7 @@ mod tests {
             components: crate::config::ComponentsConfig { valid: vec![] },
             principles: vec![],
         };
-        ThinkingServer::new(Arc::new(config), None, None, Arc::new(RwLock::new(HashMap::new())))
+        ThinkingServer::new(Arc::new(config), None, None, Arc::new(RwLock::new(HashMap::new())), None)
     }
 
     // --- Task 1 tests ---
@@ -881,7 +1111,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_new() {
         let config = Config::load("config/feldspar.toml", "config/principles.toml");
-        let server = ThinkingServer::new(config, None, None, Arc::new(RwLock::new(HashMap::new())));
+        let server = ThinkingServer::new(config, None, None, Arc::new(RwLock::new(HashMap::new())), None);
         assert!(server.db.is_none());
         assert!(server.ml.is_none());
         assert!(server.llm.is_none());
@@ -1225,6 +1455,124 @@ mod tests {
         assert!(!wire.warnings.iter().any(|w|
             w.contains("TRUST") || w.contains("THINKING_MODE") || w.contains("OPENROUTER")
         ));
+    }
+
+    // --- ML integration tests ---
+
+    fn make_trained_ml() -> Arc<crate::ml::MlEngine> {
+        use std::path::PathBuf;
+        let booster = crate::ml::MlEngine::default_booster(0.5);
+        let mut mode_map = HashMap::new();
+        mode_map.insert("architecture".to_string(), 0);
+        mode_map.insert("debugging".to_string(), 1);
+        let engine = crate::ml::MlEngine::new(booster, mode_map, PathBuf::from("/tmp/test_ml.bin"));
+        // Train with 5 samples to flush the buffer and produce trees
+        for i in 0..5 {
+            engine.train(vec![i as f64 * 0.1; 16], (i as f64 + 1.0) * 1.5);
+        }
+        Arc::new(engine)
+    }
+
+    fn test_server_with_ml() -> ThinkingServer {
+        let config = crate::config::Config {
+            feldspar: crate::config::FeldsparConfig {
+                db_path: "test.db".into(),
+                model_path: "test.model".into(),
+                recap_every: 3,
+                pattern_recall_top_k: 3,
+                ml_budget: 0.5,
+                pattern_recall_min_traces: 10,
+            },
+            llm: crate::config::LlmConfig {
+                base_url: None,
+                api_key_env: Some("TEST_KEY".into()),
+                model: "test-model".into(),
+            },
+            thresholds: crate::config::ThresholdsConfig {
+                confidence_gap: 25.0,
+                over_analysis_multiplier: 1.5,
+                overthinking_multiplier: 2.0,
+            },
+            budgets: HashMap::from([
+                ("minimal".into(), [2, 3]),
+                ("standard".into(), [3, 5]),
+                ("deep".into(), [5, 8]),
+            ]),
+            modes: HashMap::from([
+                (
+                    "architecture".into(),
+                    crate::config::ModeConfig {
+                        requires: vec![],
+                        budget: "deep".into(),
+                        watches: String::new(),
+                    },
+                ),
+            ]),
+            components: crate::config::ComponentsConfig { valid: vec![] },
+            principles: vec![],
+        };
+        ThinkingServer::new(
+            Arc::new(config),
+            None,
+            None,
+            Arc::new(RwLock::new(HashMap::new())),
+            Some(make_trained_ml()),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_ml_predict_populates_trajectory() {
+        let server = test_server_with_ml();
+        let mut input = test_input(1, None, true);
+        input.confidence = Some(75.0);
+        let wire = server.process_thought(input).await.unwrap();
+        // Trained model should produce a trajectory in [0,1]
+        assert!(wire.trajectory.is_some(), "trajectory should be Some after training");
+        let t = wire.trajectory.unwrap();
+        assert!((0.0..=1.0).contains(&t), "trajectory {t} not in [0,1]");
+    }
+
+    #[tokio::test]
+    async fn test_ml_drift_field_populated() {
+        let server = test_server_with_ml();
+        let input = test_input(1, None, true);
+        let wire = server.process_thought(input).await.unwrap();
+        // drift_detected is always Some when ML is present (false until drift fires)
+        assert!(wire.drift_detected.is_some(), "drift_detected should be Some when ML present");
+    }
+
+    #[tokio::test]
+    async fn test_pattern_recall_below_min_traces() {
+        // leaf_cache has 5 entries (below default min of 10) → pattern_recall None
+        let server = test_server_with_ml();
+        {
+            let mut cache = server.leaf_cache.write().await;
+            for i in 0..5 {
+                cache.insert(format!("trace_{i}"), vec![i, i + 1, i + 2]);
+            }
+        }
+        let input = test_input(1, None, true);
+        let wire = server.process_thought(input).await.unwrap();
+        assert!(wire.pattern_recall.is_none(), "pattern_recall None when below min_traces");
+    }
+
+    #[tokio::test]
+    async fn test_pattern_recall_none_without_ml() {
+        // Existing behavior: no ML → no pattern_recall
+        let server = test_server();
+        let input = test_input(1, None, true);
+        let wire = server.process_thought(input).await.unwrap();
+        assert!(wire.pattern_recall.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_process_thought_without_ml_no_trajectory() {
+        let server = test_server();
+        let input = test_input(1, None, true);
+        let wire = server.process_thought(input).await.unwrap();
+        assert!(wire.trajectory.is_none());
+        assert!(wire.drift_detected.is_none());
+        assert!(wire.pattern_recall.is_none());
     }
 
     #[tokio::test]

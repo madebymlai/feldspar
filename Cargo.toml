@@ -31,7 +31,7 @@ strsim = "0.11"
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio-rusqlite = "0.6"
-bincode = "2"
+bincode = { version = "2", features = ["serde"] }
 
 # Config
 toml = "0.8"

@@ -69,6 +69,9 @@ impl Db {
                 row.get::<_, String>(0)
             })?;
             conn.execute_batch(SCHEMA_SQL)?;
+            // Idempotent migration: add features column if not present.
+            // SQLite returns error on duplicate column — we ignore it.
+            let _ = conn.execute_batch("ALTER TABLE traces ADD COLUMN features BLOB");
             Ok(())
         }).await {
             warn!("failed to init DB schema: {}", e);
@@ -109,17 +112,19 @@ impl Db {
         trace_id: &str,
         thinking_mode: Option<&str>,
         components: &[String],
+        features: Option<&[u8]>,
         created_at: i64,
     ) {
         let trace_id = trace_id.to_owned();
         let thinking_mode = thinking_mode.map(|s| s.to_owned());
         let components_json = serde_json::to_string(components).unwrap_or_default();
+        let features = features.map(|f| f.to_vec());
 
         if let Err(e) = self.conn.call(move |conn| {
             conn.execute(
-                "INSERT INTO traces (id, thinking_mode, components, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![trace_id, thinking_mode, components_json, created_at],
+                "INSERT INTO traces (id, thinking_mode, components, features, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![trace_id, thinking_mode, components_json, features, created_at],
             )?;
             Ok(())
         }).await {
@@ -266,6 +271,75 @@ impl Db {
         })
     }
 
+    pub async fn load_feature_matrix(&self) -> Vec<(Vec<f64>, f64)> {
+        self.conn.call(|conn| {
+            // Guard: features column may not exist on old DBs that skipped migration.
+            if conn.prepare("SELECT features FROM traces LIMIT 0").is_err() {
+                return Ok(Vec::new());
+            }
+
+            let mut stmt = conn.prepare(
+                "SELECT features, trust_score FROM traces
+                 WHERE features IS NOT NULL AND trust_score IS NOT NULL"
+            )?;
+            let mut results = Vec::new();
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, f64>(1)?))
+            })?;
+            for row in rows {
+                let (blob, trust_score) = row?;
+                match bincode::decode_from_slice::<Vec<f64>, _>(
+                    &blob, bincode::config::standard()
+                ) {
+                    Ok((features, _)) => results.push((features, trust_score)),
+                    Err(e) => warn!("skipping trace: features decode failed: {}", e),
+                }
+            }
+            Ok(results)
+        }).await.unwrap_or_else(|e| {
+            warn!("load_feature_matrix failed: {}", e);
+            Vec::new()
+        })
+    }
+
+    pub async fn trace_count_with_trust(&self) -> usize {
+        self.conn.call(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM traces WHERE trust_score IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(count as usize)
+        }).await.unwrap_or_else(|e| {
+            warn!("trace_count_with_trust failed: {}", e);
+            0
+        })
+    }
+
+    pub async fn batch_update_leaf_nodes(&self, updates: &[(String, Vec<u8>)]) {
+        if updates.is_empty() {
+            return;
+        }
+        let updates = updates.to_vec();
+
+        if let Err(e) = self.conn.call(move |conn| {
+            conn.execute_batch("BEGIN")?;
+            for (trace_id, blob) in &updates {
+                if let Err(e) = conn.execute(
+                    "UPDATE traces SET leaf_nodes = ?1 WHERE id = ?2",
+                    rusqlite::params![blob, trace_id],
+                ) {
+                    conn.execute_batch("ROLLBACK")?;
+                    return Err(e.into());
+                }
+            }
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }).await {
+            warn!("batch_update_leaf_nodes failed: {}", e);
+        }
+    }
+
     pub async fn prune(&self, trace_ids: &[String]) {
         if trace_ids.is_empty() {
             return;
@@ -349,6 +423,69 @@ mod tests {
         assert!(db.is_none());
     }
 
+    #[tokio::test]
+    async fn test_open_adds_features_column() {
+        let (db, _f) = test_db().await;
+        // If column exists, SELECT will succeed
+        let result = db.conn.call(|conn| {
+            conn.execute("SELECT features FROM traces LIMIT 0", [])?;
+            Ok(())
+        }).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_open_migration_idempotent() {
+        let f = NamedTempFile::new().unwrap();
+        let path = f.path().to_str().unwrap().to_owned();
+        let db1 = Db::open(&path).await;
+        assert!(db1.is_some());
+        drop(db1);
+        // Second open must not fail even though features column already exists
+        let db2 = Db::open(&path).await;
+        assert!(db2.is_some());
+        let result = db2.unwrap().conn.call(|conn| {
+            conn.execute("SELECT features FROM traces LIMIT 0", [])?;
+            Ok(())
+        }).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_open_existing_db_without_features() {
+        let f = NamedTempFile::new().unwrap();
+        let path = f.path().to_str().unwrap().to_owned();
+
+        // Create a DB with old schema (no features column)
+        {
+            let conn = tokio_rusqlite::Connection::open(&path).await.unwrap();
+            conn.call(|conn| {
+                conn.execute_batch("
+                    CREATE TABLE IF NOT EXISTS traces (
+                        id TEXT PRIMARY KEY,
+                        thinking_mode TEXT,
+                        components TEXT,
+                        trust_score REAL,
+                        trust_reason TEXT,
+                        ar_scores TEXT,
+                        leaf_nodes BLOB,
+                        created_at INTEGER NOT NULL
+                    )
+                ")?;
+                Ok(())
+            }).await.unwrap();
+        }
+
+        // Now open with Db::open — migration should add features column
+        let db = Db::open(&path).await;
+        assert!(db.is_some());
+        let result = db.unwrap().conn.call(|conn| {
+            conn.execute("SELECT features FROM traces LIMIT 0", [])?;
+            Ok(())
+        }).await;
+        assert!(result.is_ok());
+    }
+
     // ─── write_thought ───────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -387,7 +524,7 @@ mod tests {
     #[tokio::test]
     async fn test_flush_trace() {
         let (db, _f) = test_db().await;
-        db.flush_trace("t1", Some("architecture"), &["auth".to_string()], 999).await;
+        db.flush_trace("t1", Some("architecture"), &["auth".to_string()], None, 999).await;
 
         let (trust, ar, leaf): (Option<f64>, Option<String>, Option<Vec<u8>>) =
             db.conn.call(|conn| {
@@ -403,12 +540,45 @@ mod tests {
         assert!(leaf.is_none());
     }
 
+    #[tokio::test]
+    async fn test_flush_trace_with_features() {
+        let (db, _f) = test_db().await;
+        let features = vec![1u8, 2, 3, 4];
+        db.flush_trace("tf1", None, &[], Some(&features), 1).await;
+
+        let blob: Option<Vec<u8>> = db.conn.call(|conn| {
+            Ok(conn.query_row(
+                "SELECT features FROM traces WHERE id = 'tf1'",
+                [],
+                |r| r.get(0),
+            )?)
+        }).await.unwrap();
+
+        assert_eq!(blob, Some(vec![1u8, 2, 3, 4]));
+    }
+
+    #[tokio::test]
+    async fn test_flush_trace_without_features() {
+        let (db, _f) = test_db().await;
+        db.flush_trace("tf2", None, &[], None, 1).await;
+
+        let blob: Option<Vec<u8>> = db.conn.call(|conn| {
+            Ok(conn.query_row(
+                "SELECT features FROM traces WHERE id = 'tf2'",
+                [],
+                |r| r.get(0),
+            )?)
+        }).await.unwrap();
+
+        assert!(blob.is_none());
+    }
+
     // ─── update_trust ────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_update_trust() {
         let (db, _f) = test_db().await;
-        db.flush_trace("t2", None, &[], 1).await;
+        db.flush_trace("t2", None, &[], None, 1).await;
         db.update_trust("t2", 7.5, "good reasoning").await;
 
         let (score, reason): (f64, String) = db.conn.call(|conn| {
@@ -428,7 +598,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_ar() {
         let (db, _f) = test_db().await;
-        db.flush_trace("t3", None, &[], 1).await;
+        db.flush_trace("t3", None, &[], None, 1).await;
         db.update_ar("t3", r#"{"critical":0,"recommended":2}"#).await;
 
         let ar: String = db.conn.call(|conn| {
@@ -447,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn test_store_leaf_nodes() {
         let (db, _f) = test_db().await;
-        db.flush_trace("t4", None, &[], 1).await;
+        db.flush_trace("t4", None, &[], None, 1).await;
         db.store_leaf_nodes("t4", &[1, 5, 42, 100]).await;
 
         let blob: Vec<u8> = db.conn.call(|conn| {
@@ -474,9 +644,9 @@ mod tests {
     #[tokio::test]
     async fn test_load_traces_populated() {
         let (db, _f) = test_db().await;
-        db.flush_trace("a", Some("debugging"), &["redis".into()], 1).await;
-        db.flush_trace("b", Some("architecture"), &["auth".into(), "db".into()], 2).await;
-        db.flush_trace("c", None, &[], 3).await;
+        db.flush_trace("a", Some("debugging"), &["redis".into()], None, 1).await;
+        db.flush_trace("b", Some("architecture"), &["auth".into(), "db".into()], None, 2).await;
+        db.flush_trace("c", None, &[], None, 3).await;
 
         let rows = db.load_traces().await;
         assert_eq!(rows.len(), 3);
@@ -487,9 +657,9 @@ mod tests {
     #[tokio::test]
     async fn test_load_leaf_nodes_skips_null() {
         let (db, _f) = test_db().await;
-        db.flush_trace("la", None, &[], 1).await;
-        db.flush_trace("lb", None, &[], 2).await;
-        db.flush_trace("lc", None, &[], 3).await;
+        db.flush_trace("la", None, &[], None, 1).await;
+        db.flush_trace("lb", None, &[], None, 2).await;
+        db.flush_trace("lc", None, &[], None, 3).await;
         db.store_leaf_nodes("lb", &[7, 8, 9]).await;
 
         let entries = db.load_leaf_nodes().await;
@@ -500,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_leaf_nodes_bincode_roundtrip() {
         let (db, _f) = test_db().await;
-        db.flush_trace("lr", None, &[], 1).await;
+        db.flush_trace("lr", None, &[], None, 1).await;
         db.store_leaf_nodes("lr", &[10, 20, 30, 40, 50]).await;
 
         let entries = db.load_leaf_nodes().await;
@@ -511,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_leaf_nodes_skips_corrupted() {
         let (db, _f) = test_db().await;
-        db.flush_trace("lx", None, &[], 1).await;
+        db.flush_trace("lx", None, &[], None, 1).await;
         // Manually insert invalid bincode blob
         db.conn.call(|conn| {
             conn.execute(
@@ -531,7 +701,7 @@ mod tests {
     async fn test_find_traces_by_ids_subset() {
         let (db, _f) = test_db().await;
         for id in ["f1", "f2", "f3", "f4", "f5"] {
-            db.flush_trace(id, None, &[], 1).await;
+            db.flush_trace(id, None, &[], None, 1).await;
         }
         let results = db.find_traces_by_ids(&["f2".into(), "f4".into()]).await;
         assert_eq!(results.len(), 2);
@@ -557,7 +727,7 @@ mod tests {
     #[tokio::test]
     async fn test_components_roundtrip() {
         let (db, _f) = test_db().await;
-        db.flush_trace("cr", None, &["redis".into(), "auth".into()], 1).await;
+        db.flush_trace("cr", None, &["redis".into(), "auth".into()], None, 1).await;
         let rows = db.load_traces().await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].components, vec!["redis", "auth"]);
@@ -566,10 +736,142 @@ mod tests {
     #[tokio::test]
     async fn test_components_empty() {
         let (db, _f) = test_db().await;
-        db.flush_trace("ce", None, &[], 1).await;
+        db.flush_trace("ce", None, &[], None, 1).await;
         let rows = db.load_traces().await;
         assert_eq!(rows.len(), 1);
         assert!(rows[0].components.is_empty());
+    }
+
+    // ─── load_feature_matrix ─────────────────────────────────────────────────
+
+    fn encode_features(features: &[f64]) -> Vec<u8> {
+        bincode::encode_to_vec(features, bincode::config::standard()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_load_feature_matrix_empty() {
+        let (db, _f) = test_db().await;
+        assert!(db.load_feature_matrix().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_feature_matrix_filters_null_trust() {
+        let (db, _f) = test_db().await;
+        let blob = encode_features(&[1.0, 2.0]);
+        db.flush_trace("fm1", None, &[], Some(&blob), 1).await;
+        // No update_trust call — trust_score stays NULL
+        let result = db.load_feature_matrix().await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_feature_matrix_filters_null_features() {
+        let (db, _f) = test_db().await;
+        db.flush_trace("fm2", None, &[], None, 1).await;
+        db.update_trust("fm2", 8.0, "ok").await;
+        let result = db.load_feature_matrix().await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_feature_matrix_roundtrip() {
+        let (db, _f) = test_db().await;
+        let features = vec![0.1f64, 0.5, 0.9];
+        let blob = encode_features(&features);
+        db.flush_trace("fm3", None, &[], Some(&blob), 1).await;
+        db.update_trust("fm3", 7.5, "good").await;
+
+        let result = db.load_feature_matrix().await;
+        assert_eq!(result.len(), 1);
+        let (got_features, got_trust) = &result[0];
+        assert_eq!(got_features, &features);
+        assert!((got_trust - 7.5).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_load_feature_matrix_skips_corrupted() {
+        let (db, _f) = test_db().await;
+        // Insert a valid trace
+        let blob = encode_features(&[1.0, 2.0]);
+        db.flush_trace("fm4", None, &[], Some(&blob), 1).await;
+        db.update_trust("fm4", 6.0, "ok").await;
+        // Insert a corrupt-blob trace directly
+        db.flush_trace("fm5", None, &[], None, 2).await;
+        db.conn.call(|conn| {
+            conn.execute(
+                "UPDATE traces SET features = X'DEADBEEF', trust_score = 5.0 WHERE id = 'fm5'",
+                [],
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        let result = db.load_feature_matrix().await;
+        // Only fm4 (valid) should be returned; fm5 (corrupted) skipped
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec![1.0f64, 2.0]);
+    }
+
+    // ─── trace_count_with_trust ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_trace_count_with_trust_zero() {
+        let (db, _f) = test_db().await;
+        assert_eq!(db.trace_count_with_trust().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_trace_count_with_trust_partial() {
+        let (db, _f) = test_db().await;
+        db.flush_trace("tc1", None, &[], None, 1).await;
+        db.flush_trace("tc2", None, &[], None, 2).await;
+        db.flush_trace("tc3", None, &[], None, 3).await;
+        db.update_trust("tc1", 5.0, "ok").await;
+        db.update_trust("tc3", 8.0, "ok").await;
+
+        assert_eq!(db.trace_count_with_trust().await, 2);
+    }
+
+    // ─── batch_update_leaf_nodes ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_batch_update_leaf_nodes_multiple() {
+        let (db, _f) = test_db().await;
+        db.flush_trace("bn1", None, &[], None, 1).await;
+        db.flush_trace("bn2", None, &[], None, 2).await;
+        db.flush_trace("bn3", None, &[], None, 3).await;
+
+        let blob1 = bincode::encode_to_vec(&vec![1usize, 2], bincode::config::standard()).unwrap();
+        let blob2 = bincode::encode_to_vec(&vec![3usize, 4], bincode::config::standard()).unwrap();
+        db.batch_update_leaf_nodes(&[
+            ("bn1".into(), blob1.clone()),
+            ("bn2".into(), blob2.clone()),
+        ]).await;
+
+        let (b1, b2, b3): (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) =
+            db.conn.call(|conn| {
+                let b1 = conn.query_row("SELECT leaf_nodes FROM traces WHERE id='bn1'", [], |r| r.get(0))?;
+                let b2 = conn.query_row("SELECT leaf_nodes FROM traces WHERE id='bn2'", [], |r| r.get(0))?;
+                let b3 = conn.query_row("SELECT leaf_nodes FROM traces WHERE id='bn3'", [], |r| r.get(0))?;
+                Ok((b1, b2, b3))
+            }).await.unwrap();
+
+        assert_eq!(b1, Some(blob1));
+        assert_eq!(b2, Some(blob2));
+        assert!(b3.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_batch_update_leaf_nodes_empty() {
+        let (db, _f) = test_db().await;
+        db.batch_update_leaf_nodes(&[]).await; // must not error
+    }
+
+    #[tokio::test]
+    async fn test_batch_update_leaf_nodes_nonexistent_trace() {
+        let (db, _f) = test_db().await;
+        let blob = bincode::encode_to_vec(&vec![1usize], bincode::config::standard()).unwrap();
+        // UPDATE 0 rows — no error expected
+        db.batch_update_leaf_nodes(&[("ghost".into(), blob)]).await;
     }
 
     // ─── prune ───────────────────────────────────────────────────────────────
@@ -577,7 +879,7 @@ mod tests {
     #[tokio::test]
     async fn test_prune_removes_traces_and_thoughts() {
         let (db, _f) = test_db().await;
-        db.flush_trace("p1", None, &[], 1).await;
+        db.flush_trace("p1", None, &[], None, 1).await;
         for i in 1..=3 {
             db.write_thought("p1", i, None, "{}", "{}", i as i64).await;
         }
@@ -598,7 +900,7 @@ mod tests {
     async fn test_prune_only_targeted() {
         let (db, _f) = test_db().await;
         for id in ["q1", "q2", "q3"] {
-            db.flush_trace(id, None, &[], 1).await;
+            db.flush_trace(id, None, &[], None, 1).await;
             db.write_thought(id, 1, None, "{}", "{}", 1).await;
         }
         db.prune(&["q1".into()]).await;
