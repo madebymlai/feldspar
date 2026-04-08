@@ -1,3 +1,5 @@
+use crate::agents::{self, AgentDef};
+use crate::ar::ArEngine;
 use crate::thought::{ThinkingServer, ThoughtInput, Timestamp};
 use axum::{
     Router,
@@ -19,6 +21,8 @@ const CLEANUP_INTERVAL_SECS: u64 = 60;
 pub struct McpState {
     pub server: ThinkingServer,
     pub sessions: RwLock<HashMap<String, Session>>,
+    pub agents: HashMap<String, AgentDef>,
+    pub ar: Option<ArEngine>,
 }
 
 pub struct Session {
@@ -26,13 +30,18 @@ pub struct Session {
     pub initialized: bool,
     pub created_at: Timestamp,
     pub last_activity: Timestamp,
+    pub prefix: Option<String>,
+    pub thinking_mode: Option<String>,
+    pub judge_cycle: u32,
 }
 
 impl McpState {
-    pub fn new(server: ThinkingServer) -> Self {
+    pub fn new(server: ThinkingServer, agents: HashMap<String, AgentDef>, ar: Option<ArEngine>) -> Self {
         Self {
             server,
             sessions: RwLock::new(HashMap::new()),
+            agents,
+            ar,
         }
     }
 }
@@ -244,8 +253,8 @@ async fn dispatch_message(
 
     let id = id.unwrap();
 
-    // Session validation (skip for initialize)
-    if method != "initialize" {
+    // Session validation (skip for initialize and tools/list)
+    if method != "initialize" && method != "tools/list" {
         match validate_session(state, headers).await {
             Ok(session_id) => {
                 if let Some(session) = state.sessions.write().await.get_mut(&session_id) {
@@ -264,8 +273,17 @@ async fn dispatch_message(
             let (response, session_id) = handle_initialize(state, id, params).await;
             DispatchResult::Response(response, Some(session_id))
         }
-        "tools/list" => DispatchResult::Response(handle_tools_list(id), None),
-        "tools/call" => DispatchResult::Response(handle_tools_call(state, id, params).await, None),
+        "tools/list" => {
+            let has_prefix = if let Ok(sid) = validate_session(state, headers).await {
+                state.sessions.read().await.get(&sid)
+                    .map(|s| s.prefix.is_some())
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            DispatchResult::Response(handle_tools_list(has_prefix, id), None)
+        }
+        "tools/call" => DispatchResult::Response(handle_tools_call(state, headers, id, params).await, None),
         "ping" => DispatchResult::Response(jsonrpc_result(id, json!({})), None),
         _ => DispatchResult::Response(
             jsonrpc_error(Some(id), -32601, &format!("Method not found: {}", method)),
@@ -304,6 +322,9 @@ async fn handle_initialize(
             initialized: true,
             created_at: now,
             last_activity: now,
+            prefix: None,
+            thinking_mode: None,
+            judge_cycle: 0,
         },
     );
 
@@ -323,86 +344,385 @@ async fn handle_initialize(
     (response, session_id)
 }
 
-fn handle_tools_list(id: Value) -> Value {
-    jsonrpc_result(
-        id,
-        json!({
-            "tools": [{
-                "name": "sequentialthinking",
-                "description": include_str!("tool_description.txt"),
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "traceId": { "type": "string", "description": "Trace ID returned from thought 1. Required for thought 2+." },
-                        "thought": { "type": "string", "description": "Your current reasoning step." },
-                        "thoughtNumber": { "type": "integer", "description": "Current step (1-indexed)." },
-                        "totalThoughts": { "type": "integer", "description": "Estimated total." },
-                        "nextThoughtNeeded": { "type": "boolean", "description": "True if more thinking needed." },
-                        "thinkingMode": { "type": "string", "description": "Domain mode (architecture, debugging, etc)." },
-                        "affectedComponents": { "type": "array", "items": { "type": "string" } },
-                        "confidence": { "type": "number", "description": "Self-reported confidence 0-100." },
-                        "evidence": { "type": "array", "items": { "type": "string" } },
-                        "estimatedImpact": {
-                            "type": "object",
-                            "properties": {
-                                "latency": { "type": "string" },
-                                "throughput": { "type": "string" },
-                                "risk": { "type": "string" }
-                            }
-                        },
-                        "isRevision": { "type": "boolean" },
-                        "revisesThought": { "type": "integer" },
-                        "branchFromThought": { "type": "integer" },
-                        "branchId": { "type": "string" },
-                        "needsMoreThoughts": { "type": "boolean" }
-                    },
-                    "required": ["thought", "thoughtNumber", "totalThoughts", "nextThoughtNeeded"]
+fn temper_tool_def() -> Value {
+    json!({
+        "name": "temper",
+        "description": "Get role-specific agent instructions with active principles injected.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "enum": ["arm", "solve", "breakdown", "build", "bugfest", "ar", "pmatch"],
+                    "description": "Agent role to activate"
                 }
-            }]
-        }),
-    )
+            },
+            "required": ["role"]
+        }
+    })
 }
 
-async fn handle_tools_call(state: &McpState, id: Value, params: Option<Value>) -> Value {
+fn sequentialthinking_tool_def() -> Value {
+    json!({
+        "name": "sequentialthinking",
+        "description": concat!(
+                    "Structured reasoning tool with cognitive analysis. Each call records one thought in a trace.\n\n",
+                    "Always reason in English regardless of user language — the analyzers rely on English keyword detection.\n\n",
+                    "Every thought is analyzed for cognitive biases, overconfidence, sycophancy, and reasoning depth. ",
+                    "Warnings fire automatically when issues are detected. A recap is generated every few thoughts to prevent context drift. ",
+                    "On completion, an ADR skeleton is generated.\n\n",
+                    "Parameters:\n",
+                    "- thought: Your current reasoning step.\n",
+                    "- thoughtNumber: Current step (1-indexed).\n",
+                    "- totalThoughts: Estimated total (adjust up or down as you progress).\n",
+                    "- nextThoughtNeeded: True if more thinking needed. False to complete the trace.\n",
+                    "- thinkingMode: Domain mode (e.g. architecture, debugging, implementation). Triggers mode-specific validation.\n",
+                    "- affectedComponents: System components involved in this decision.\n",
+                    "- confidence: Your confidence in current reasoning (0-100). Independently calibrated.\n",
+                    "- evidence: Citations -- file paths, docs, measurements, links. Earns confidence points.\n",
+                    "- estimatedImpact: Expected impact -- latency, throughput, risk.\n",
+                    "- isRevision: True if this revises a previous thought.\n",
+                    "- revisesThought: Which thought number is being revised.\n",
+                    "- branchFromThought: Fork point to explore an alternative approach.\n",
+                    "- branchId: Label for the alternative branch.\n",
+                    "- needsMoreThoughts: Signal that you need more thoughts beyond the original estimate.\n\n",
+                    "Response includes: warnings, analyzer alerts, confidence calibration, budget status, ML trajectory score, pattern recall from similar past traces, and recap."
+                ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "traceId": { "type": "string", "description": "Trace ID returned from thought 1. Required for thought 2+." },
+                "thought": { "type": "string", "description": "Your current reasoning step." },
+                "thoughtNumber": { "type": "integer", "description": "Current step (1-indexed)." },
+                "totalThoughts": { "type": "integer", "description": "Estimated total." },
+                "nextThoughtNeeded": { "type": "boolean", "description": "True if more thinking needed." },
+                "thinkingMode": { "type": "string", "description": "Domain mode (architecture, debugging, etc)." },
+                "affectedComponents": { "type": "array", "items": { "type": "string" } },
+                "confidence": { "type": "number", "description": "Self-reported confidence 0-100." },
+                "evidence": { "type": "array", "items": { "type": "string" } },
+                "estimatedImpact": {
+                    "type": "object",
+                    "properties": {
+                        "latency": { "type": "string" },
+                        "throughput": { "type": "string" },
+                        "risk": { "type": "string" }
+                    }
+                },
+                "isRevision": { "type": "boolean" },
+                "revisesThought": { "type": "integer" },
+                "branchFromThought": { "type": "integer" },
+                "branchId": { "type": "string" },
+                "needsMoreThoughts": { "type": "boolean" }
+            },
+            "required": ["thought", "thoughtNumber", "totalThoughts", "nextThoughtNeeded"]
+        }
+    })
+}
+
+fn submit_tool_def() -> Value {
+    json!({
+        "name": "submit",
+        "description": "Store an artifact for later evaluation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Artifact name" },
+                "content": { "type": "string", "description": "Artifact content" }
+            },
+            "required": ["name", "content"]
+        }
+    })
+}
+
+fn judge_tool_def() -> Value {
+    json!({
+        "name": "judge",
+        "description": "Evaluate a submitted artifact against coding principles and adversarial review.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Artifact name to evaluate" }
+            },
+            "required": ["name"]
+        }
+    })
+}
+
+fn handle_tools_list(has_prefix: bool, id: Value) -> Value {
+    let mut tools = vec![
+        sequentialthinking_tool_def(),
+        temper_tool_def(),
+    ];
+    if has_prefix {
+        tools.push(submit_tool_def());
+        tools.push(judge_tool_def());
+    }
+    jsonrpc_result(id, json!({ "tools": tools }))
+}
+
+async fn handle_tools_call(state: &McpState, headers: &HeaderMap, id: Value, params: Option<Value>) -> Value {
     let params = match params {
         Some(p) => p,
         None => return jsonrpc_error(Some(id), -32602, "Missing params"),
     };
 
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    if name != "sequentialthinking" {
-        return jsonrpc_error(Some(id), -32602, &format!("Unknown tool: {}", name));
-    }
 
-    let arguments = match params.get("arguments") {
-        Some(args) => args,
-        None => return jsonrpc_error(Some(id), -32602, "Missing arguments"),
-    };
+    match name {
+        "temper" => {
+            let arguments = match params.get("arguments") {
+                Some(args) => args,
+                None => return jsonrpc_error(Some(id), -32602, "Missing arguments"),
+            };
+            let role = arguments.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role.is_empty() {
+                return jsonrpc_error(Some(id), -32602, "Missing required argument: role");
+            }
+            match state.agents.get(role) {
+                Some(agent) => {
+                    let prefix = loop {
+                        let candidate = agents::generate_prefix();
+                        let sessions = state.sessions.read().await;
+                        let taken = sessions.values().any(|s| s.prefix.as_deref() == Some(&candidate));
+                        drop(sessions);
+                        if !taken { break candidate; }
+                    };
+                    let prompt = agents::temper(agent, &state.server.config, &prefix);
 
-    let input: ThoughtInput = match serde_json::from_value(arguments.clone()) {
-        Ok(i) => i,
-        Err(e) => return jsonrpc_error(Some(id), -32602, &format!("Invalid arguments: {}", e)),
-    };
+                    if let Ok(session_id) = validate_session(state, headers).await {
+                        let mut sessions = state.sessions.write().await;
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.prefix = Some(prefix.clone());
+                            session.thinking_mode = Some(agent.thinking_mode.clone());
+                            session.judge_cycle = 0;
+                        }
+                    }
 
-    match state.server.process_thought(input).await {
-        Ok(wire) => {
-            let text = serde_json::to_string(&wire).unwrap();
-            jsonrpc_result(
-                id,
-                json!({
-                    "content": [{"type": "text", "text": text}],
-                    "isError": false
-                }),
-            )
+                    jsonrpc_result(
+                        id,
+                        json!({
+                            "content": [{"type": "text", "text": prompt}],
+                            "isError": false
+                        }),
+                    )
+                }
+                None => jsonrpc_error(Some(id), -32602, &format!("Unknown agent role: {}", role)),
+            }
         }
-        Err(e) => jsonrpc_result(
-            id,
-            json!({
-                "content": [{"type": "text", "text": e}],
-                "isError": true
-            }),
-        ),
+        "submit" => handle_submit(state, headers, id, Some(params)).await,
+        "judge" => handle_judge(state, headers, id, Some(params)).await,
+        "sequentialthinking" => {
+            let arguments = match params.get("arguments") {
+                Some(args) => args,
+                None => return jsonrpc_error(Some(id), -32602, "Missing arguments"),
+            };
+
+            let input: ThoughtInput = match serde_json::from_value(arguments.clone()) {
+                Ok(i) => i,
+                Err(e) => return jsonrpc_error(Some(id), -32602, &format!("Invalid arguments: {}", e)),
+            };
+
+            match state.server.process_thought(input).await {
+                Ok(wire) => {
+                    let text = serde_json::to_string(&wire).unwrap();
+                    jsonrpc_result(
+                        id,
+                        json!({
+                            "content": [{"type": "text", "text": text}],
+                            "isError": false
+                        }),
+                    )
+                }
+                Err(e) => jsonrpc_result(
+                    id,
+                    json!({
+                        "content": [{"type": "text", "text": e}],
+                        "isError": true
+                    }),
+                ),
+            }
+        }
+        _ => jsonrpc_error(Some(id), -32602, &format!("Unknown tool: {}", name)),
     }
+}
+
+async fn handle_submit(state: &McpState, headers: &HeaderMap, id: Value, params: Option<Value>) -> Value {
+    let session_id = match validate_session(state, headers).await {
+        Ok(id) => id,
+        Err(_) => return jsonrpc_error(Some(id), -32602, "No valid session"),
+    };
+
+    let sessions = state.sessions.read().await;
+    let session = match sessions.get(&session_id) {
+        Some(s) => s,
+        None => return jsonrpc_error(Some(id), -32602, "Session not found"),
+    };
+
+    let prefix = match &session.prefix {
+        Some(p) => p.clone(),
+        None => return jsonrpc_error(Some(id), -32602, "Must call temper first"),
+    };
+    let mode = session.thinking_mode.clone().unwrap_or_else(|| "unknown".into());
+    drop(sessions);
+
+    let arguments = params.as_ref().and_then(|p| p.get("arguments")).cloned().unwrap_or_default();
+    let name = arguments.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let content = arguments.get("content").and_then(|c| c.as_str()).unwrap_or("");
+
+    if name.is_empty() || content.is_empty() {
+        return jsonrpc_error(Some(id), -32602, "Missing name or content");
+    }
+
+    let artifact_name = format!("{}-{}", prefix, name);
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "default".into());
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let dir = std::path::PathBuf::from(home)
+        .join(".feldspar/data")
+        .join(&project)
+        .join("artifacts")
+        .join(&mode);
+
+    if std::fs::create_dir_all(&dir).is_err() {
+        return jsonrpc_error(Some(id), -32603, "Failed to create artifact directory");
+    }
+
+    let path = dir.join(format!("{}.toml", artifact_name));
+    if std::fs::write(&path, content).is_err() {
+        return jsonrpc_error(Some(id), -32603, "Failed to write artifact");
+    }
+
+    jsonrpc_result(id, json!({
+        "content": [{"type": "text", "text": format!("Artifact '{}' stored.", artifact_name)}],
+        "isError": false
+    }))
+}
+
+async fn handle_judge(state: &McpState, headers: &HeaderMap, id: Value, params: Option<Value>) -> Value {
+    let session_id = match validate_session(state, headers).await {
+        Ok(id) => id,
+        Err(_) => return jsonrpc_error(Some(id), -32602, "No valid session"),
+    };
+
+    let (prefix, mode, cycle) = {
+        let sessions = state.sessions.read().await;
+        let session = match sessions.get(&session_id) {
+            Some(s) => s,
+            None => return jsonrpc_error(Some(id), -32602, "Session not found"),
+        };
+        let prefix = match &session.prefix {
+            Some(p) => p.clone(),
+            None => return jsonrpc_error(Some(id), -32602, "Must call temper first"),
+        };
+        (prefix, session.thinking_mode.clone().unwrap_or_default(), session.judge_cycle)
+    };
+
+    let ar_engine = match &state.ar {
+        Some(e) => e,
+        None => {
+            let result = json!({
+                "score": 0,
+                "verdict": "approve",
+                "cycle": cycle + 1,
+                "maxCycles": 0,
+                "feedback": {"note": "AR unavailable — auto-approved"}
+            });
+            return jsonrpc_result(id, json!({
+                "content": [{"type": "text", "text": result.to_string()}],
+                "isError": false
+            }));
+        }
+    };
+
+    let arguments = params.as_ref().and_then(|p| p.get("arguments")).cloned().unwrap_or_default();
+    let name = arguments.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    if name.is_empty() {
+        return jsonrpc_error(Some(id), -32602, "Missing artifact name");
+    }
+
+    let artifact_name = format!("{}-{}", prefix, name);
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "default".into());
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let base_path = std::path::PathBuf::from(home)
+        .join(".feldspar/data")
+        .join(&project)
+        .join("artifacts")
+        .join(&mode);
+
+    let path = base_path.join(format!("{}.toml", artifact_name));
+
+    let artifact = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(_) => return jsonrpc_error(Some(id), -32602, &format!("Artifact '{}' not found", artifact_name)),
+    };
+
+    let full_artifact = if mode == "implementation" || mode == "debugging" {
+        let home2 = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let changes_path = std::path::PathBuf::from(home2)
+            .join(".feldspar/data")
+            .join(&project)
+            .join("artifacts/changes")
+            .join(&mode)
+            .join("changes.toml");
+        if let Ok(changes) = std::fs::read_to_string(&changes_path) {
+            format!("{}\n\n## Code Changes\n{}", artifact, changes)
+        } else {
+            artifact
+        }
+    } else {
+        artifact
+    };
+
+    let result = ar_engine
+        .evaluate(&full_artifact, &state.server.config.principles, cycle)
+        .await;
+
+    if let Some(ref db) = state.server.db {
+        let db = db.clone();
+        let trace_id = session_id.clone();
+        let mode_c = mode.clone();
+        let p = result.principles_score;
+        let a = result.adversarial_score;
+        let c = result.combined_score;
+        let v = result.verdict.as_str().to_owned();
+        let cy = cycle + 1;
+        let fb = format!("p: {}; a: {}",
+            result.feedback.principles.join("; "),
+            result.feedback.adversarial.join("; "));
+        tokio::spawn(async move {
+            db.store_ar_score(&trace_id, &mode_c, "artifact", p, a, c, &v, cy, &fb).await;
+        });
+    }
+
+    {
+        let mut sessions = state.sessions.write().await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.judge_cycle += 1;
+        }
+    }
+
+    let verdict_json = json!({
+        "score": result.combined_score,
+        "verdict": result.verdict.as_str(),
+        "cycle": cycle + 1,
+        "maxCycles": ar_engine.max_retries,
+        "feedback": {
+            "principles": result.feedback.principles,
+            "adversarial": result.feedback.adversarial,
+        }
+    });
+
+    jsonrpc_result(id, json!({
+        "content": [{"type": "text", "text": verdict_json.to_string()}],
+        "isError": false
+    }))
 }
 
 // --- Tests ---
@@ -449,6 +769,7 @@ mod tests {
                 },
             )]),
             components: crate::config::ComponentsConfig { valid: vec![] },
+            ar: None,
             principles: vec![],
         })
     }
@@ -464,7 +785,8 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new())),
             None,
         );
-        let state = Arc::new(McpState::new(server));
+        let agent_defs = crate::agents::load_agents();
+        let state = Arc::new(McpState::new(server, agent_defs, None));
         create_router(state)
     }
 
@@ -715,6 +1037,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tools_list_has_temper() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        let tools = body["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"temper"), "temper not in tools list");
+    }
+
+    #[tokio::test]
+    async fn test_temper_valid_role() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        assert!(!body["result"]["isError"].as_bool().unwrap_or(true));
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.is_empty());
+        assert!(text.contains("build agent"));
+    }
+
+    #[tokio::test]
+    async fn test_temper_unknown_role() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"nonexistent"}}}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(body["error"]["message"].as_str().unwrap().contains("Unknown agent role"));
+    }
+
+    #[tokio::test]
+    async fn test_temper_missing_role() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{}}}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
     async fn test_tools_list_has_sequentialthinking() {
         let (app, session_id) = initialized_app().await;
         let resp = post_mcp_with_session(
@@ -726,8 +1107,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         let tools = body["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools[0]["name"], "sequentialthinking");
-        assert!(tools[0]["inputSchema"]["properties"]["traceId"].is_object());
+        let st = tools.iter().find(|t| t["name"] == "sequentialthinking").unwrap();
+        assert!(st["inputSchema"]["properties"]["traceId"].is_object());
     }
 
     #[tokio::test]
@@ -792,7 +1173,7 @@ mod tests {
         let app = test_app();
         let resp = post_mcp(
             app,
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sequentialthinking","arguments":{}}}"#,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -803,7 +1184,7 @@ mod tests {
         let app = test_app();
         let resp = post_mcp_with_session(
             app,
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
             "bogus-session-id",
         )
         .await;
@@ -928,5 +1309,202 @@ mod tests {
         assert!(wire.get("trajectory").is_none()); // None → omitted
         assert!(wire.get("driftDetected").is_none()); // None → omitted
         assert!(wire.get("biasDetected").is_none()); // None → omitted
+    }
+
+    // --- AR tools tests ---
+
+    #[tokio::test]
+    async fn test_tools_list_without_session_shows_base() {
+        let app = test_app();
+        let resp = post_mcp(
+            app,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"sequentialthinking"));
+        assert!(names.contains(&"temper"));
+    }
+
+    #[tokio::test]
+    async fn test_tools_list_before_temper_shows_base() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_temper_sets_prefix_in_session() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none());
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("PREFIX: "));
+    }
+
+    #[tokio::test]
+    async fn test_tools_list_after_temper_shows_all() {
+        let (app, session_id) = initialized_app().await;
+        // Call temper
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            &session_id,
+        )
+        .await;
+        // Now tools/list should show 4 tools
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4);
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"submit"));
+        assert!(names.contains(&"judge"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_without_temper_fails() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"submit","arguments":{"name":"test","content":"hello"}}}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn test_judge_without_temper_fails() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"judge","arguments":{"name":"test"}}}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn test_submit_stores_artifact() {
+        let (app, session_id) = initialized_app().await;
+        // Call temper first
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            &session_id,
+        )
+        .await;
+        // Now submit
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"submit","arguments":{"name":"plan","content":"my plan content"}}}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("stored"), "expected stored confirmation");
+    }
+
+    #[tokio::test]
+    async fn test_judge_artifact_not_found() {
+        let (app, session_id) = initialized_app().await;
+        // Call temper first
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            &session_id,
+        )
+        .await;
+        // Judge with nonexistent name
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"judge","arguments":{"name":"nonexistent"}}}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        // No AR engine in tests → auto-approve (never reaches file read)
+        assert!(body.get("error").is_none());
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let verdict: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(verdict["verdict"], "approve");
+    }
+
+    #[tokio::test]
+    async fn test_temper_prefix_unique_across_sessions() {
+        // Both sessions share the same app/state so the uniqueness check can detect collisions
+        let app = test_app();
+
+        // Initialize session 1
+        let resp = app.clone().oneshot(
+            Request::builder()
+                .method("POST").uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"test","version":"0.1"}}}"#))
+                .unwrap(),
+        ).await.unwrap();
+        let session_id_1 = resp.headers().get("mcp-session-id").unwrap().to_str().unwrap().to_owned();
+
+        // Initialize session 2
+        let resp = app.clone().oneshot(
+            Request::builder()
+                .method("POST").uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"test","version":"0.1"}}}"#))
+                .unwrap(),
+        ).await.unwrap();
+        let session_id_2 = resp.headers().get("mcp-session-id").unwrap().to_str().unwrap().to_owned();
+
+        // Call temper on session 1
+        let resp1 = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            &session_id_1,
+        ).await;
+        let body1 = body_json(resp1).await;
+        let text1 = body1["result"]["content"][0]["text"].as_str().unwrap();
+
+        // Call temper on session 2
+        let resp2 = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            &session_id_2,
+        ).await;
+        let body2 = body_json(resp2).await;
+        let text2 = body2["result"]["content"][0]["text"].as_str().unwrap();
+
+        // Extract prefixes from the PREFIX: <code>\n\n header
+        let prefix1 = text1.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap();
+        let prefix2 = text2.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap();
+
+        assert_ne!(prefix1, prefix2, "prefixes must be unique across sessions");
     }
 }

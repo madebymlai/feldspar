@@ -107,7 +107,7 @@ ask = [
 ]
 
 [groups.tdd]
-active = false
+active = true
 
 [[groups.tdd.principles]]
 name = "Test-Driven Development"

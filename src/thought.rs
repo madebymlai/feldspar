@@ -1,5 +1,4 @@
 use crate::analyzers::run_pipeline;
-use crate::ar::{ArEngine, ArVerdict};
 use crate::config::Config;
 use crate::llm::LlmClient;
 use crate::warnings::generate_warnings;
@@ -108,29 +107,9 @@ pub struct WireResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_reason: Option<String>,
 
-    // AR quality gate (completion only, AR-gated modes)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ar: Option<ArWireResult>,
-
     // Pattern recall (thought 1 only)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern_recall: Option<Vec<crate::db::PatternMatch>>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ArWireResult {
-    pub score: u32,
-    pub verdict: String,
-    pub cycle: u32,
-    pub max_cycles: u32,
-    pub feedback: ArWireFeedback,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ArWireFeedback {
-    pub principles: Vec<String>,
-    pub adversarial: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -165,7 +144,6 @@ pub struct Trace {
     pub thoughts: Vec<ThoughtRecord>,
     pub created_at: Timestamp,
     pub closed: bool,
-    pub ar_cycle: u32,
 }
 
 impl Trace {
@@ -178,7 +156,6 @@ impl Trace {
                 .unwrap()
                 .as_millis() as i64,
             closed: false,
-            ar_cycle: 0,
         }
     }
 }
@@ -190,7 +167,6 @@ pub struct ThinkingServer {
     pub ml: Option<Arc<crate::ml::MlEngine>>,
     pub llm: Option<LlmClient>,
     pub leaf_cache: Arc<RwLock<HashMap<String, Vec<usize>>>>,
-    pub ar: Option<ArEngine>,
 }
 
 impl ThinkingServer {
@@ -200,7 +176,6 @@ impl ThinkingServer {
         db: Option<Arc<crate::db::Db>>,
         leaf_cache: Arc<RwLock<HashMap<String, Vec<usize>>>>,
         ml: Option<Arc<crate::ml::MlEngine>>,
-        ar: Option<ArEngine>,
     ) -> Self {
         Self {
             traces: RwLock::new(HashMap::new()),
@@ -209,7 +184,6 @@ impl ThinkingServer {
             ml,
             llm,
             leaf_cache,
-            ar,
         }
     }
 
@@ -217,8 +191,6 @@ impl ThinkingServer {
         // === PHASE 1: Write lock held (microseconds) ===
         let mut recap_text: Option<String> = None;
         let mut removed_trace: Option<Trace> = None;
-        let mut thought_history_for_ar: Option<String> = None;
-        let mut ar_cycle_snapshot: u32 = 0;
         let snapshot;
 
         {
@@ -304,20 +276,6 @@ impl ThinkingServer {
                 recap_text = Some(formatted);
             }
 
-            // Capture AR inputs on completion (before eviction — trace still accessible)
-            ar_cycle_snapshot = trace.ar_cycle;
-            if !input.next_thought_needed {
-                thought_history_for_ar = Some(
-                    trace.thoughts
-                        .iter()
-                        .filter(|t| t.input.branch_id == input.branch_id)
-                        .enumerate()
-                        .map(|(i, t)| format!("Thought {}: {}", i + 1, t.input.thought))
-                        .collect::<Vec<_>>()
-                        .join("\n\n")
-                );
-            }
-
             // If completing: remove trace for eviction
             if !input.next_thought_needed {
                 removed_trace = traces.remove(&trace_id);
@@ -344,84 +302,6 @@ impl ThinkingServer {
         } else {
             None
         };
-
-        // AR quality gate (blocking — deliberate HC#2 exception, same rationale as trust scoring:
-        // the agent must receive the verdict in the same completion response).
-        // Runs before ADR/trust so a Revise verdict zeroes out removed_trace, naturally
-        // skipping ADR, trust scoring, and all background persistence tasks.
-        let mut ar_wire: Option<ArWireResult> = None;
-
-        if !input.next_thought_needed {
-            if let Some(ref mode) = input.thinking_mode {
-                if ArEngine::is_ar_gated(mode) {
-                    if let Some(ref ar_engine) = self.ar {
-                        let history = thought_history_for_ar.as_deref().unwrap_or("");
-                        let result = ar_engine
-                            .evaluate(mode, history, &self.config.principles, ar_cycle_snapshot)
-                            .await;
-
-                        let verdict_str = result.verdict.as_str().to_owned();
-                        let ar_revise = result.verdict == ArVerdict::Revise;
-                        let artifact_type = match mode.as_str() {
-                            "implementation" | "debugging" => "git_diff",
-                            _ => "thought_history",
-                        };
-                        let feedback_text = format!(
-                            "principles: {}; adversarial: {}",
-                            result.feedback.principles.join("; "),
-                            result.feedback.adversarial.join("; ")
-                        );
-
-                        // Store score best-effort (fire-and-forget)
-                        if let Some(ref db) = self.db {
-                            let db = db.clone();
-                            let trace_id_ar = snapshot.trace_id.clone();
-                            let mode_ar = mode.clone();
-                            let art_type = artifact_type.to_owned();
-                            let p_score = result.principles_score;
-                            let a_score = result.adversarial_score;
-                            let c_score = result.combined_score;
-                            let v_str = verdict_str.clone();
-                            let cycle_num = ar_cycle_snapshot + 1;
-                            tokio::spawn(async move {
-                                db.store_ar_score(
-                                    &trace_id_ar,
-                                    &mode_ar,
-                                    &art_type,
-                                    p_score,
-                                    a_score,
-                                    c_score,
-                                    &v_str,
-                                    cycle_num,
-                                    &feedback_text,
-                                )
-                                .await;
-                            });
-                        }
-
-                        ar_wire = Some(ArWireResult {
-                            score: result.combined_score,
-                            verdict: verdict_str,
-                            cycle: ar_cycle_snapshot + 1,
-                            max_cycles: ar_engine.max_retries,
-                            feedback: ArWireFeedback {
-                                principles: result.feedback.principles,
-                                adversarial: result.feedback.adversarial,
-                            },
-                        });
-
-                        if ar_revise {
-                            // Re-insert trace with incremented ar_cycle so the agent can continue.
-                            // Zeroing removed_trace causes ADR/trust/background tasks to be skipped.
-                            if let Some(mut trace) = removed_trace.take() {
-                                trace.ar_cycle = ar_cycle_snapshot + 1;
-                                self.traces.write().await.insert(snapshot.trace_id.clone(), trace);
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         // ADR from removed trace
         let adr = if let Some(ref trace) = removed_trace {
@@ -609,18 +489,11 @@ impl ThinkingServer {
             });
         }
 
-        // If AR says Revise, override nextThoughtNeeded so the agent continues
-        let next_thought_needed_final = if ar_wire.as_ref().map(|r| r.verdict == "revise").unwrap_or(false) {
-            true
-        } else {
-            input.next_thought_needed
-        };
-
         Ok(WireResponse {
             trace_id: snapshot.trace_id,
             thought_number: input.thought_number,
             total_thoughts: input.total_thoughts,
-            next_thought_needed: next_thought_needed_final,
+            next_thought_needed: input.next_thought_needed,
             branches: snapshot.branches,
             thought_history_length: snapshot.thought_history_length,
             warnings,
@@ -643,7 +516,6 @@ impl ThinkingServer {
             adr,
             trust_score,
             trust_reason,
-            ar: ar_wire,
             pattern_recall,
         })
     }
@@ -1000,7 +872,7 @@ mod tests {
             ar: None,
             principles: vec![],
         };
-        ThinkingServer::new(Arc::new(config), None, None, Arc::new(RwLock::new(HashMap::new())), None, None)
+        ThinkingServer::new(Arc::new(config), None, None, Arc::new(RwLock::new(HashMap::new())), None)
     }
 
     // --- Task 1 tests ---
@@ -1058,7 +930,6 @@ mod tests {
             adr: None,
             trust_score: None,
             trust_reason: None,
-            ar: None,
             pattern_recall: None,
         };
         let value = serde_json::to_value(&wire).unwrap();
@@ -1095,7 +966,6 @@ mod tests {
             adr: None,
             trust_score: None,
             trust_reason: None,
-            ar: None,
             pattern_recall: None,
         };
         let value = serde_json::to_value(&wire).unwrap();
@@ -1242,7 +1112,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_new() {
         let config = Config::load("config/feldspar.toml", "config/principles.toml");
-        let server = ThinkingServer::new(config, None, None, Arc::new(RwLock::new(HashMap::new())), None, None);
+        let server = ThinkingServer::new(config, None, None, Arc::new(RwLock::new(HashMap::new())), None);
         assert!(server.db.is_none());
         assert!(server.ml.is_none());
         assert!(server.llm.is_none());
@@ -1541,7 +1411,6 @@ mod tests {
             adr: None,
             trust_score: None,
             trust_reason: None,
-            ar: None,
             pattern_recall: None,
         };
         let json_str = serde_json::to_string(&wire).unwrap();
@@ -1650,7 +1519,6 @@ mod tests {
             None,
             Arc::new(RwLock::new(HashMap::new())),
             Some(make_trained_ml()),
-            None,
         )
     }
 
@@ -1762,7 +1630,6 @@ mod tests {
             None,
             Arc::new(RwLock::new(HashMap::new())),
             Some(ml),
-            None,
         );
         let input = test_input(1, None, true);
         let wire = server.process_thought(input).await.unwrap();
@@ -1827,68 +1694,4 @@ mod tests {
         assert!(w2.adr.unwrap().contains("final decision here"));
     }
 
-    // --- AR gate tests ---
-
-    #[tokio::test]
-    async fn test_ar_skipped_when_no_engine() {
-        // No AR engine → wire.ar should be None on completion
-        let server = test_server(); // ar: None
-        let w1 = server.process_thought(test_input(1, None, true)).await.unwrap();
-        let id = w1.trace_id.clone();
-        let mut input2 = test_input(2, Some(id), false);
-        input2.thinking_mode = Some("implementation".into());
-        let w2 = server.process_thought(input2).await.unwrap();
-        assert!(w2.ar.is_none(), "AR field absent when no ArEngine");
-    }
-
-    #[tokio::test]
-    async fn test_ar_skipped_for_brainstorming() {
-        // brainstorming is not AR-gated → wire.ar should be None even with engine
-        let server = test_server(); // ar: None (engine disabled)
-        let w1 = server.process_thought(test_input(1, None, true)).await.unwrap();
-        let id = w1.trace_id.clone();
-        let mut input2 = test_input(2, Some(id), false);
-        input2.thinking_mode = Some("brainstorm".into());
-        let w2 = server.process_thought(input2).await.unwrap();
-        assert!(w2.ar.is_none(), "AR field absent for non-gated mode");
-    }
-
-    #[test]
-    fn test_ar_cycle_defaults_to_zero() {
-        let trace = Trace::new();
-        assert_eq!(trace.ar_cycle, 0);
-    }
-
-    #[test]
-    fn test_wire_response_ar_field_omitted_when_none() {
-        let wire = WireResponse {
-            trace_id: "t1".into(),
-            thought_number: 1,
-            total_thoughts: 1,
-            next_thought_needed: false,
-            branches: vec![],
-            thought_history_length: 1,
-            warnings: vec![],
-            alerts: vec![],
-            confidence_reported: None,
-            confidence_calculated: None,
-            confidence_gap: None,
-            bias_detected: None,
-            sycophancy: None,
-            depth_overlap: None,
-            budget_used: 1,
-            budget_max: 3,
-            budget_category: "minimal".into(),
-            trajectory: None,
-            drift_detected: None,
-            recap: None,
-            adr: None,
-            trust_score: None,
-            trust_reason: None,
-            ar: None,
-            pattern_recall: None,
-        };
-        let json = serde_json::to_string(&wire).unwrap();
-        assert!(!json.contains("\"ar\""), "ar key must be absent when None");
-    }
 }

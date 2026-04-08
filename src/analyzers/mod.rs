@@ -371,6 +371,7 @@ pub(crate) mod tests {
             components: ComponentsConfig {
                 valid: vec!["redis".into(), "postgres".into()],
             },
+            ar: None,
             principles: vec![],
         }
     }

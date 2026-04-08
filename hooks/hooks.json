@@ -13,6 +13,20 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|Bash",
+        "id": "feldspar:record-change",
+        "description": "Capture file changes for AR evaluation",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "feldspar hook record-change",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

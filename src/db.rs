@@ -48,10 +48,24 @@ const SCHEMA_SQL: &str = "
         components      TEXT,
         trust_score     REAL,
         trust_reason    TEXT,
-        ar_scores       TEXT,
+        trace_score     TEXT,
         leaf_nodes      BLOB,
         created_at      INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS ar_scores (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        trace_id            TEXT NOT NULL,
+        thinking_mode       TEXT NOT NULL,
+        artifact_type       TEXT NOT NULL,
+        principles_score    INTEGER,
+        adversarial_score   INTEGER,
+        combined_score      INTEGER NOT NULL,
+        verdict             TEXT NOT NULL CHECK(verdict IN ('approve', 'revise', 'escalate')),
+        cycle               INTEGER NOT NULL DEFAULT 1,
+        feedback            TEXT,
+        created_at          INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ar_scores_trace ON ar_scores(trace_id);
 ";
 
 impl Db {
@@ -144,21 +158,6 @@ impl Db {
             Ok(())
         }).await {
             warn!("update_trust failed: {}", e);
-        }
-    }
-
-    pub async fn update_ar(&self, trace_id: &str, ar_scores_json: &str) {
-        let trace_id = trace_id.to_owned();
-        let ar_scores_json = ar_scores_json.to_owned();
-
-        if let Err(e) = self.conn.call(move |conn| {
-            conn.execute(
-                "UPDATE traces SET ar_scores = ?1 WHERE id = ?2",
-                rusqlite::params![ar_scores_json, trace_id],
-            )?;
-            Ok(())
-        }).await {
-            warn!("update_ar failed: {}", e);
         }
     }
 
@@ -337,6 +336,39 @@ impl Db {
             Ok(())
         }).await {
             warn!("batch_update_leaf_nodes failed: {}", e);
+        }
+    }
+
+    pub async fn store_ar_score(
+        &self,
+        trace_id: &str,
+        thinking_mode: &str,
+        artifact_type: &str,
+        principles_score: u32,
+        adversarial_score: u32,
+        combined_score: u32,
+        verdict: &str,
+        cycle: u32,
+        feedback: &str,
+    ) {
+        let trace_id = trace_id.to_owned();
+        let thinking_mode = thinking_mode.to_owned();
+        let artifact_type = artifact_type.to_owned();
+        let verdict = verdict.to_owned();
+        let feedback = feedback.to_owned();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        if let Err(e) = self.conn.call(move |conn| {
+            conn.execute(
+                "INSERT INTO ar_scores (trace_id, thinking_mode, artifact_type, principles_score, adversarial_score, combined_score, verdict, cycle, feedback, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![trace_id, thinking_mode, artifact_type, principles_score, adversarial_score, combined_score, verdict, cycle, feedback, now],
+            )?;
+            Ok(())
+        }).await {
+            warn!("store_ar_score failed: {}", e);
         }
     }
 
@@ -526,17 +558,17 @@ mod tests {
         let (db, _f) = test_db().await;
         db.flush_trace("t1", Some("architecture"), &["auth".to_string()], None, 999).await;
 
-        let (trust, ar, leaf): (Option<f64>, Option<String>, Option<Vec<u8>>) =
+        let (trust, trace_sc, leaf): (Option<f64>, Option<String>, Option<Vec<u8>>) =
             db.conn.call(|conn| {
                 Ok(conn.query_row(
-                    "SELECT trust_score, ar_scores, leaf_nodes FROM traces WHERE id = 't1'",
+                    "SELECT trust_score, trace_score, leaf_nodes FROM traces WHERE id = 't1'",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )?)
             }).await.unwrap();
 
         assert!(trust.is_none());
-        assert!(ar.is_none());
+        assert!(trace_sc.is_none());
         assert!(leaf.is_none());
     }
 
@@ -591,25 +623,6 @@ mod tests {
 
         assert!((score - 7.5).abs() < f64::EPSILON);
         assert_eq!(reason, "good reasoning");
-    }
-
-    // ─── update_ar ───────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_update_ar() {
-        let (db, _f) = test_db().await;
-        db.flush_trace("t3", None, &[], None, 1).await;
-        db.update_ar("t3", r#"{"critical":0,"recommended":2}"#).await;
-
-        let ar: String = db.conn.call(|conn| {
-            Ok(conn.query_row(
-                "SELECT ar_scores FROM traces WHERE id = 't3'",
-                [],
-                |r| r.get(0),
-            )?)
-        }).await.unwrap();
-
-        assert_eq!(ar, r#"{"critical":0,"recommended":2}"#);
     }
 
     // ─── store_leaf_nodes ────────────────────────────────────────────────────
@@ -926,5 +939,50 @@ mod tests {
     async fn test_prune_nonexistent_ids() {
         let (db, _f) = test_db().await;
         db.prune(&["nonexistent".into()]).await; // DELETE 0 rows, no error
+    }
+
+    // ─── store_ar_score ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_store_ar_score() {
+        let (db, _f) = test_db().await;
+        db.store_ar_score("trace-ar1", "implementation", "git_diff", 85, 78, 78, "revise", 1, "some feedback").await;
+
+        let row: (String, String, String, i64, i64, i64, String, i64, String) =
+            db.conn.call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT trace_id, thinking_mode, artifact_type, principles_score, adversarial_score, combined_score, verdict, cycle, feedback FROM ar_scores WHERE trace_id='trace-ar1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+                )?)
+            }).await.unwrap();
+
+        assert_eq!(row.0, "trace-ar1");
+        assert_eq!(row.1, "implementation");
+        assert_eq!(row.2, "git_diff");
+        assert_eq!(row.3, 85);
+        assert_eq!(row.4, 78);
+        assert_eq!(row.5, 78);
+        assert_eq!(row.6, "revise");
+        assert_eq!(row.7, 1);
+        assert_eq!(row.8, "some feedback");
+    }
+
+    #[tokio::test]
+    async fn test_store_ar_score_multiple_cycles() {
+        let (db, _f) = test_db().await;
+        db.store_ar_score("trace-ar2", "debugging", "git_diff", 70, 65, 65, "revise", 1, "cycle 1").await;
+        db.store_ar_score("trace-ar2", "debugging", "git_diff", 80, 75, 75, "revise", 2, "cycle 2").await;
+        db.store_ar_score("trace-ar2", "debugging", "git_diff", 92, 91, 91, "approve", 3, "cycle 3").await;
+
+        let count: i64 = db.conn.call(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM ar_scores WHERE trace_id='trace-ar2'",
+                [],
+                |r| r.get(0),
+            )?)
+        }).await.unwrap();
+
+        assert_eq!(count, 3);
     }
 }

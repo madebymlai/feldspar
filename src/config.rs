@@ -13,8 +13,17 @@ pub struct Config {
     pub budgets: HashMap<String, [u32; 2]>,
     pub modes: HashMap<String, ModeConfig>,
     pub components: ComponentsConfig,
+    pub ar: Option<ArConfig>,
     #[serde(skip)]
     pub principles: Vec<PrincipleGroup>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArConfig {
+    pub threshold: u32,
+    pub max_retries: u32,
+    pub principles_model: String,
+    pub adversarial_model: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +186,12 @@ fn validate(config: &Config, principles: &[PrincipleGroup]) {
         "thresholds.overthinking_multiplier must be > 0"
     );
 
+    // AR config: threshold 0-100, max_retries >= 1
+    if let Some(ar) = &config.ar {
+        assert!(ar.threshold <= 100, "ar.threshold must be <= 100");
+        assert!(ar.max_retries >= 1, "ar.max_retries must be >= 1");
+    }
+
     // Principles: active groups must have at least one principle
     for group in principles {
         assert!(
@@ -243,6 +258,7 @@ mod tests {
                 ),
             ]),
             components: ComponentsConfig { valid: vec![] },
+            ar: None,
             principles: vec![],
         }
     }
@@ -272,14 +288,14 @@ mod tests {
         let names: Vec<&str> = config.principles.iter().map(|g| g.name.as_str()).collect();
         assert!(names.contains(&"solid"));
         assert!(names.contains(&"kiss-dry"));
-        assert!(!names.contains(&"tdd"));
+        assert!(names.contains(&"tdd"));
         assert!(!names.contains(&"security"));
     }
 
     #[test]
     fn test_inactive_groups_excluded() {
         let config = Config::load("config/feldspar.toml", "config/principles.toml");
-        assert!(config.principles.iter().all(|g| g.name != "tdd"));
+        assert!(config.principles.iter().all(|g| g.name != "security"));
     }
 
     #[test]
@@ -513,6 +529,53 @@ standard = [3, 5]
 [components]
 valid = []
 "#
+    }
+
+    #[test]
+    fn test_ar_config_parses() {
+        let toml = format!(
+            "{}\n[ar]\nthreshold = 90\nmax_retries = 3\nprinciples_model = \"z-ai/glm-4.7-flash\"\nadversarial_model = \"openai/gpt-oss-120b:nitro\"\n",
+            minimal_feldspar_toml()
+        );
+        let config: Config = toml::from_str(&toml).expect("should parse");
+        assert!(config.ar.is_some());
+        let ar = config.ar.unwrap();
+        assert_eq!(ar.threshold, 90);
+        assert_eq!(ar.max_retries, 3);
+        assert_eq!(ar.principles_model, "z-ai/glm-4.7-flash");
+        assert_eq!(ar.adversarial_model, "openai/gpt-oss-120b:nitro");
+    }
+
+    #[test]
+    fn test_ar_config_optional() {
+        let config: Config = toml::from_str(minimal_feldspar_toml()).expect("should parse");
+        assert!(config.ar.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "ar.threshold must be <= 100")]
+    fn test_ar_threshold_validation() {
+        let mut config = test_config();
+        config.ar = Some(ArConfig {
+            threshold: 101,
+            max_retries: 3,
+            principles_model: "test".into(),
+            adversarial_model: "test".into(),
+        });
+        validate(&config, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "ar.max_retries must be >= 1")]
+    fn test_ar_max_retries_validation() {
+        let mut config = test_config();
+        config.ar = Some(ArConfig {
+            threshold: 90,
+            max_retries: 0,
+            principles_model: "test".into(),
+            adversarial_model: "test".into(),
+        });
+        validate(&config, &[]);
     }
 
     #[test]

@@ -67,6 +67,56 @@ static LANGUAGE_PATTERNS: LazyLock<Vec<WarningPattern>> = LazyLock::new(|| {
     ]
 });
 
+static BATCH_EXECUTION_PATTERNS: LazyLock<Vec<WarningPattern>> = LazyLock::new(|| {
+    vec![
+        WarningPattern {
+            regex: Regex::new(r"(?i)\ball\s+tasks?\s+(at\s+once|together|simultaneously)\b").unwrap(),
+            label: "BATCH_EXECUTION",
+            message: "Batch execution detected — implement one task at a time, test each before moving on.",
+        },
+        WarningPattern {
+            regex: Regex::new(r"(?i)\bimplement\s+tasks?\s+\d+\s*(through|to|-)\s*\d+\b").unwrap(),
+            label: "BATCH_EXECUTION",
+            message: "Batch execution detected — implement one task at a time, test each before moving on.",
+        },
+        WarningPattern {
+            regex: Regex::new(r"(?i)\blet\s+me\s+(do|implement|tackle|handle)\s+(everything|all\s+of)\b").unwrap(),
+            label: "BATCH_EXECUTION",
+            message: "Batch execution detected — implement one task at a time, test each before moving on.",
+        },
+        WarningPattern {
+            regex: Regex::new(r"(?i)\btackle\s+all\b.*\btogether\b").unwrap(),
+            label: "BATCH_EXECUTION",
+            message: "Batch execution detected — implement one task at a time, test each before moving on.",
+        },
+    ]
+});
+
+static TDD_BYPASS_PATTERNS: LazyLock<Vec<WarningPattern>> = LazyLock::new(|| {
+    vec![
+        WarningPattern {
+            regex: Regex::new(r"(?i)\b(write|add|create)\s+tests?\s+later\b").unwrap(),
+            label: "TDD_BYPASS",
+            message: "TDD bypass detected — write tests before or alongside implementation. Red → Green → Refactor.",
+        },
+        WarningPattern {
+            regex: Regex::new(r"(?i)\bskip\s+tests?\s+(for\s+now|first)\b").unwrap(),
+            label: "TDD_BYPASS",
+            message: "TDD bypass detected — write tests before or alongside implementation. Red → Green → Refactor.",
+        },
+        WarningPattern {
+            regex: Regex::new(r"(?i)\bimplement\s+first\b.*\btest\b").unwrap(),
+            label: "TDD_BYPASS",
+            message: "TDD bypass detected — write tests before or alongside implementation. Red → Green → Refactor.",
+        },
+        WarningPattern {
+            regex: Regex::new(r"(?i)\btests?\s+can\s+wait\b").unwrap(),
+            label: "TDD_BYPASS",
+            message: "TDD bypass detected — write tests before or alongside implementation. Red → Green → Refactor.",
+        },
+    ]
+});
+
 fn check_language(thought: &str) -> Vec<String> {
     LANGUAGE_PATTERNS
         .iter()
@@ -193,6 +243,26 @@ pub fn generate_warnings(
     warnings.extend(check_budget(input, recent_progress, config));
     warnings.extend(check_mode(input, config));
 
+    let mode = input.thinking_mode.as_deref();
+    let is_impl_or_debug = matches!(mode, Some("implementation") | Some("debugging"));
+
+    if is_impl_or_debug {
+        for pattern in BATCH_EXECUTION_PATTERNS.iter() {
+            if pattern.regex.is_match(&input.thought) {
+                warnings.push(format!("WARNING [{}]: {}", pattern.label, pattern.message));
+            }
+        }
+    }
+
+    let tdd_active = config.principles.iter().any(|g| g.name == "tdd");
+    if is_impl_or_debug && tdd_active {
+        for pattern in TDD_BYPASS_PATTERNS.iter() {
+            if pattern.regex.is_match(&input.thought) {
+                warnings.push(format!("WARNING [{}]: {}", pattern.label, pattern.message));
+            }
+        }
+    }
+
     // Dedup by label — keep first occurrence per [LABEL]
     let mut seen = HashSet::new();
     warnings.retain(|w| {
@@ -255,6 +325,7 @@ mod tests {
             budgets,
             modes,
             components: ComponentsConfig { valid: vec![] },
+            ar: None,
             principles: vec![],
         }
     }
@@ -546,6 +617,100 @@ mod tests {
         input.confidence = None;
         let w = generate_warnings(&input, &vec![], &config);
         assert!(w.iter().any(|s| s.contains("NO-CONFIDENCE")));
+    }
+
+    // --- BATCH_EXECUTION tests ---
+
+    fn impl_input(thought: &str) -> ThoughtInput {
+        let mut input = test_input(thought);
+        input.thinking_mode = Some("implementation".into());
+        input
+    }
+
+    #[test]
+    fn test_batch_all_tasks_at_once() {
+        let w = generate_warnings(&impl_input("Let me implement all tasks at once"), &vec![], &test_config());
+        assert!(w.iter().any(|s| s.contains("BATCH_EXECUTION")));
+    }
+
+    #[test]
+    fn test_batch_tasks_1_through_5() {
+        let w = generate_warnings(&impl_input("I'll implement tasks 1 through 5"), &vec![], &test_config());
+        assert!(w.iter().any(|s| s.contains("BATCH_EXECUTION")));
+    }
+
+    #[test]
+    fn test_batch_do_everything() {
+        let w = generate_warnings(&impl_input("Let me do everything first"), &vec![], &test_config());
+        assert!(w.iter().any(|s| s.contains("BATCH_EXECUTION")));
+    }
+
+    #[test]
+    fn test_batch_not_in_brainstorming() {
+        let mut input = test_input("Let me implement all tasks at once");
+        input.thinking_mode = Some("brainstorming".into());
+        let w = generate_warnings(&input, &vec![], &test_config());
+        assert!(!w.iter().any(|s| s.contains("BATCH_EXECUTION")));
+    }
+
+    #[test]
+    fn test_batch_normal_task_mention() {
+        let w = generate_warnings(&impl_input("Starting task 3 now"), &vec![], &test_config());
+        assert!(!w.iter().any(|s| s.contains("BATCH_EXECUTION")));
+    }
+
+    // --- TDD_BYPASS tests ---
+
+    fn tdd_config() -> Config {
+        let mut config = test_config();
+        config.principles = vec![crate::config::PrincipleGroup {
+            name: "tdd".into(),
+            active: true,
+            principles: vec![crate::config::Principle {
+                name: "TDD".into(),
+                rule: "Red Green Refactor".into(),
+                ask: vec![],
+            }],
+        }];
+        config
+    }
+
+    #[test]
+    fn test_tdd_write_tests_later() {
+        let w = generate_warnings(&impl_input("I'll write tests later"), &vec![], &tdd_config());
+        assert!(w.iter().any(|s| s.contains("TDD_BYPASS")));
+    }
+
+    #[test]
+    fn test_tdd_skip_tests() {
+        let w = generate_warnings(&impl_input("Skip tests for now and ship"), &vec![], &tdd_config());
+        assert!(w.iter().any(|s| s.contains("TDD_BYPASS")));
+    }
+
+    #[test]
+    fn test_tdd_implement_first() {
+        let w = generate_warnings(&impl_input("Let me implement first then add the test"), &vec![], &tdd_config());
+        assert!(w.iter().any(|s| s.contains("TDD_BYPASS")));
+    }
+
+    #[test]
+    fn test_tdd_not_when_inactive() {
+        let w = generate_warnings(&impl_input("I'll write tests later"), &vec![], &test_config());
+        assert!(!w.iter().any(|s| s.contains("TDD_BYPASS")));
+    }
+
+    #[test]
+    fn test_tdd_not_in_brainstorming() {
+        let mut input = test_input("I'll write tests later");
+        input.thinking_mode = Some("brainstorming".into());
+        let w = generate_warnings(&input, &vec![], &tdd_config());
+        assert!(!w.iter().any(|s| s.contains("TDD_BYPASS")));
+    }
+
+    #[test]
+    fn test_tdd_normal_test_mention() {
+        let w = generate_warnings(&impl_input("Running the test suite now"), &vec![], &tdd_config());
+        assert!(!w.iter().any(|s| s.contains("TDD_BYPASS")));
     }
 
     // --- Integration test ---

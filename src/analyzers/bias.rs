@@ -282,6 +282,7 @@ mod tests {
             budgets: HashMap::from([("standard".into(), [3u32, 5u32])]),
             modes: HashMap::new(),
             components: ComponentsConfig { valid: vec![] }, // empty — no detection
+            ar: None,
             principles: vec![],
         };
 

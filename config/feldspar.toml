@@ -64,3 +64,9 @@ watches = "Must delegate not solve, must not go past 2-3 thoughts without spawni
 
 [components]
 valid = []  # populate per project
+
+[ar]
+threshold = 90
+max_retries = 3
+principles_model = "z-ai/glm-4.7-flash"
+adversarial_model = "openai/gpt-oss-120b:nitro"

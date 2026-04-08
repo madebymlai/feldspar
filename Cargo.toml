@@ -36,6 +36,9 @@ bincode = { version = "2", features = ["serde"] }
 # Config
 toml = "0.8"
 
+# Prefix generation
+rand = "0.8"
+
 [dev-dependencies]
 assert_matches = "1.5"
 tower = { version = "0.5", features = ["util"] }

@@ -1,4 +1,6 @@
+mod agents;
 mod analyzers;
+mod ar;
 mod config;
 mod db;
 mod llm;
@@ -32,6 +34,17 @@ enum Commands {
         #[arg(long, default_value = "3581")]
         port: u16,
     },
+    /// Hook subcommands (invoked by Claude Code hooks)
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookAction {
+    /// Record file changes for AR evaluation
+    RecordChange,
 }
 
 #[tokio::main]
@@ -61,6 +74,54 @@ async fn main() {
 
             run_server(port).await;
         }
+        Commands::Hook { action } => match action {
+            HookAction::RecordChange => record_change(),
+        },
+    }
+}
+
+fn record_change() {
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "default".into());
+
+    let diff = std::process::Command::new("git")
+        .args(["diff", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
+    if diff.trim().is_empty() {
+        return;
+    }
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let artifacts_dir = std::path::PathBuf::from(home)
+        .join(".feldspar/data")
+        .join(&project)
+        .join("artifacts/build");
+
+    if std::fs::create_dir_all(&artifacts_dir).is_err() {
+        return;
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let entry = format!(
+        "\n[[changes]]\ntimestamp = {}\ndiff = \"\"\"\n{}\"\"\"\n",
+        timestamp,
+        diff.trim()
+    );
+
+    let path = artifacts_dir.join("changes.toml");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = file.write_all(entry.as_bytes());
     }
 }
 
@@ -119,9 +180,19 @@ async fn run_server(port: u16) {
     };
     let ml = ml.map(Arc::new);
 
+    let agent_defs = agents::load_agents();
+    info!(count = agent_defs.len(), "loaded agent definitions");
+
+    let ar_engine = config.ar.as_ref().and_then(|ac| ar::ArEngine::new(ac));
+    if ar_engine.is_some() {
+        info!("AR engine initialized");
+    } else {
+        info!("AR engine disabled (no config or missing OPENROUTER_API_KEY)");
+    }
+
     let leaf_cache_for_prune = leaf_cache.clone();
     let server = thought::ThinkingServer::new(config, llm, db.clone(), leaf_cache, ml.clone());
-    let state = Arc::new(mcp::McpState::new(server));
+    let state = Arc::new(mcp::McpState::new(server, agent_defs, ar_engine));
 
     let cleanup_state = state.clone();
     tokio::spawn(mcp::session_cleanup_task(cleanup_state));
