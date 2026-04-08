@@ -23,6 +23,7 @@ pub struct McpState {
     pub sessions: RwLock<HashMap<String, Session>>,
     pub agents: HashMap<String, AgentDef>,
     pub ar: Option<ArEngine>,
+    pub project_name: String,
 }
 
 pub struct Session {
@@ -36,12 +37,13 @@ pub struct Session {
 }
 
 impl McpState {
-    pub fn new(server: ThinkingServer, agents: HashMap<String, AgentDef>, ar: Option<ArEngine>) -> Self {
+    pub fn new(server: ThinkingServer, agents: HashMap<String, AgentDef>, ar: Option<ArEngine>, project_name: String) -> Self {
         Self {
             server,
             sessions: RwLock::new(HashMap::new()),
             agents,
             ar,
+            project_name,
         }
     }
 }
@@ -274,14 +276,17 @@ async fn dispatch_message(
             DispatchResult::Response(response, Some(session_id))
         }
         "tools/list" => {
-            let has_prefix = if let Ok(sid) = validate_session(state, headers).await {
+            let is_teammate = std::env::var("CLAUDE_CODE_TEAM_NAME").is_ok();
+            let has_prefix = if !is_teammate {
+                false
+            } else if let Ok(sid) = validate_session(state, headers).await {
                 state.sessions.read().await.get(&sid)
                     .map(|s| s.prefix.is_some())
                     .unwrap_or(false)
             } else {
                 false
             };
-            DispatchResult::Response(handle_tools_list(has_prefix, id), None)
+            DispatchResult::Response(handle_tools_list(is_teammate, has_prefix, id), None)
         }
         "tools/call" => DispatchResult::Response(handle_tools_call(state, headers, id, params).await, None),
         "ping" => DispatchResult::Response(jsonrpc_result(id, json!({})), None),
@@ -448,14 +453,324 @@ fn judge_tool_def() -> Value {
     })
 }
 
-fn handle_tools_list(has_prefix: bool, id: Value) -> Value {
-    let mut tools = vec![
-        sequentialthinking_tool_def(),
-        temper_tool_def(),
-    ];
-    if has_prefix {
-        tools.push(submit_tool_def());
-        tools.push(judge_tool_def());
+fn configure_tool_def() -> Value {
+    json!({
+        "name": "configure",
+        "description": "Manage feldspar principles and thinking modes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "add_group", "add_principle", "activate", "deactivate", "add_mode", "remove_mode"],
+                    "description": "Configuration action"
+                },
+                "level": { "type": "string", "enum": ["user", "project"], "description": "Config level" },
+                "group": { "type": "string", "description": "Principle group name" },
+                "active": { "type": "boolean", "description": "Group active state" },
+                "name": { "type": "string", "description": "Principle or mode name" },
+                "rule": { "type": "string", "description": "Principle rule" },
+                "ask": { "type": "array", "items": {"type": "string"}, "description": "Check questions" },
+                "budget": { "type": "string", "description": "Mode budget tier" },
+                "requires": { "type": "array", "items": {"type": "string"}, "description": "Mode requirements" },
+                "watches": { "type": "string", "description": "What mode watches" }
+            },
+            "required": ["action", "level"]
+        }
+    })
+}
+
+fn resolve_config_dir(project_name: &str, level: &str) -> std::path::PathBuf {
+    match level {
+        "user" => crate::init::user_config_dir(),
+        _ => crate::init::data_dir(project_name).join("config"),
+    }
+}
+
+fn ok_response(id: Value, message: &str) -> Value {
+    jsonrpc_result(id, json!({
+        "content": [{"type": "text", "text": message}],
+        "isError": false
+    }))
+}
+
+fn handle_configure(state: &McpState, id: Value, params: &Value) -> Value {
+    let arguments = match params.get("arguments") {
+        Some(args) => args.clone(),
+        None => return jsonrpc_error(Some(id), -32602, "Missing arguments"),
+    };
+
+    let action = match arguments.get("action").and_then(|a| a.as_str()) {
+        Some(a) => a.to_owned(),
+        None => return jsonrpc_error(Some(id), -32602, "Missing required argument: action"),
+    };
+
+    let level = match arguments.get("level").and_then(|l| l.as_str()) {
+        Some(l) => l.to_owned(),
+        None => return jsonrpc_error(Some(id), -32602, "Missing required argument: level"),
+    };
+
+    let config_dir = resolve_config_dir(&state.project_name, &level);
+
+    match action.as_str() {
+        "list" => configure_list(id, &config_dir, &level),
+        "add_group" => configure_add_group(id, &arguments, &config_dir),
+        "add_principle" => configure_add_principle(id, &arguments, &config_dir),
+        "activate" => configure_set_active(id, &arguments, &config_dir, true),
+        "deactivate" => configure_set_active(id, &arguments, &config_dir, false),
+        "add_mode" => configure_add_mode(id, &arguments, &config_dir),
+        "remove_mode" => configure_remove_mode(id, &arguments, &config_dir),
+        _ => jsonrpc_error(Some(id), -32602, &format!("Unknown action: {}", action)),
+    }
+}
+
+fn configure_list(id: Value, config_dir: &std::path::Path, level: &str) -> Value {
+    let principles_content = std::fs::read_to_string(config_dir.join("principles.toml")).unwrap_or_default();
+    let principles_val: toml::Value = toml::from_str(&principles_content)
+        .unwrap_or_else(|_| toml::Value::Table(Default::default()));
+
+    let groups_list: Vec<Value> = principles_val
+        .get("groups")
+        .and_then(|g| g.as_table())
+        .map(|groups| {
+            groups.iter().map(|(name, group)| {
+                let active = group.get("active").and_then(|a| a.as_bool()).unwrap_or(false);
+                let count = group.get("principles")
+                    .and_then(|p| p.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                json!({ "group": name, "active": active, "count": count })
+            }).collect()
+        })
+        .unwrap_or_default();
+
+    let feldspar_content = std::fs::read_to_string(config_dir.join("feldspar.toml")).unwrap_or_default();
+    let feldspar_val: toml::Value = toml::from_str(&feldspar_content)
+        .unwrap_or_else(|_| toml::Value::Table(Default::default()));
+
+    let modes_list: Vec<Value> = feldspar_val
+        .get("modes")
+        .and_then(|m| m.as_table())
+        .map(|modes| {
+            modes.iter().map(|(name, mode)| {
+                let budget = mode.get("budget").and_then(|b| b.as_str()).unwrap_or("unknown");
+                json!({ "name": name, "budget": budget })
+            }).collect()
+        })
+        .unwrap_or_default();
+
+    ok_response(id, &serde_json::to_string(&json!({
+        "principles": groups_list,
+        "modes": modes_list,
+        "level": level
+    })).unwrap_or_default())
+}
+
+fn configure_add_group(id: Value, arguments: &Value, config_dir: &std::path::Path) -> Value {
+    let group = match arguments.get("group").and_then(|g| g.as_str()) {
+        Some(g) => g.to_owned(),
+        None => return jsonrpc_error(Some(id), -32602, "Missing required argument: group"),
+    };
+    let active = arguments.get("active").and_then(|a| a.as_bool()).unwrap_or(true);
+
+    let path = config_dir.join("principles.toml");
+    let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+
+    if content.contains(&format!("[groups.{}]", group)) {
+        return jsonrpc_error(Some(id), -32602, &format!("Group '{}' already exists", group));
+    }
+
+    content.push_str(&format!("\n[groups.{}]\nactive = {}\nprinciples = []\n", group, active));
+
+    std::fs::create_dir_all(config_dir).ok();
+    match std::fs::write(&path, &content) {
+        Ok(_) => ok_response(id, &format!("Group '{}' added (active: {})", group, active)),
+        Err(e) => jsonrpc_error(Some(id), -32603, &format!("Failed to write: {}", e)),
+    }
+}
+
+fn configure_add_principle(id: Value, arguments: &Value, config_dir: &std::path::Path) -> Value {
+    let group = match arguments.get("group").and_then(|g| g.as_str()) {
+        Some(g) => g.to_owned(),
+        None => return jsonrpc_error(Some(id), -32602, "Missing required argument: group"),
+    };
+    let name = match arguments.get("name").and_then(|n| n.as_str()) {
+        Some(n) => n.to_owned(),
+        None => return jsonrpc_error(Some(id), -32602, "Missing required argument: name"),
+    };
+    let rule = match arguments.get("rule").and_then(|r| r.as_str()) {
+        Some(r) => r.to_owned(),
+        None => return jsonrpc_error(Some(id), -32602, "Missing required argument: rule"),
+    };
+    let ask: Vec<String> = arguments.get("ask")
+        .and_then(|a| serde_json::from_value(a.clone()).ok())
+        .unwrap_or_default();
+
+    let path = config_dir.join("principles.toml");
+    let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+
+    if !content.contains(&format!("[groups.{}]", group)) {
+        return jsonrpc_error(Some(id), -32602, &format!("Group '{}' not found. Use add_group first.", group));
+    }
+
+    let ask_str = ask.iter()
+        .map(|a| format!("  \"{}\",", a))
+        .collect::<Vec<_>>()
+        .join("\n");
+    content.push_str(&format!(
+        "\n[[groups.{}.principles]]\nname = \"{}\"\nrule = \"{}\"\nask = [\n{}\n]\n",
+        group, name, rule, ask_str
+    ));
+
+    match std::fs::write(&path, &content) {
+        Ok(_) => ok_response(id, &format!("Principle '{}' added to group '{}'", name, group)),
+        Err(e) => jsonrpc_error(Some(id), -32603, &format!("Failed to write: {}", e)),
+    }
+}
+
+fn configure_set_active(id: Value, arguments: &Value, config_dir: &std::path::Path, active: bool) -> Value {
+    let group = match arguments.get("group").and_then(|g| g.as_str()) {
+        Some(g) => g.to_owned(),
+        None => return jsonrpc_error(Some(id), -32602, "Missing required argument: group"),
+    };
+
+    let path = config_dir.join("principles.toml");
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let mut val: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => toml::Value::Table(Default::default()),
+    };
+
+    let group_exists = val.get("groups")
+        .and_then(|g| g.as_table())
+        .map(|t| t.contains_key(&group))
+        .unwrap_or(false);
+
+    if !group_exists {
+        return jsonrpc_error(Some(id), -32602, &format!("Group '{}' not found", group));
+    }
+
+    if let Some(groups) = val.get_mut("groups").and_then(|g| g.as_table_mut()) {
+        if let Some(g) = groups.get_mut(&group).and_then(|g| g.as_table_mut()) {
+            g.insert("active".to_owned(), toml::Value::Boolean(active));
+        }
+    }
+
+    let serialized = toml::to_string_pretty(&val).unwrap_or_default();
+    match std::fs::write(&path, &serialized) {
+        Ok(_) => ok_response(id, &format!("Group '{}' set active={}", group, active)),
+        Err(e) => jsonrpc_error(Some(id), -32603, &format!("Failed to write: {}", e)),
+    }
+}
+
+fn configure_add_mode(id: Value, arguments: &Value, config_dir: &std::path::Path) -> Value {
+    let name = match arguments.get("name").and_then(|n| n.as_str()) {
+        Some(n) => n.to_owned(),
+        None => return jsonrpc_error(Some(id), -32602, "Missing required argument: name"),
+    };
+
+    if name.contains(' ') || name.chars().any(|c| c.is_uppercase()) {
+        return jsonrpc_error(Some(id), -32602, "Mode name must be lowercase with no spaces");
+    }
+
+    let budget = arguments.get("budget").and_then(|b| b.as_str()).unwrap_or("standard");
+    let requires: Vec<String> = arguments.get("requires")
+        .and_then(|r| serde_json::from_value(r.clone()).ok())
+        .unwrap_or_default();
+    let watches = arguments.get("watches").and_then(|w| w.as_str()).unwrap_or("");
+
+    let toml_path = config_dir.join("feldspar.toml");
+    let mut content = std::fs::read_to_string(&toml_path).unwrap_or_default();
+
+    if content.contains(&format!("[modes.{}]", name)) {
+        return jsonrpc_error(Some(id), -32602, &format!("Mode '{}' already exists", name));
+    }
+
+    let requires_str = requires.iter().map(|r| format!("\"{}\"", r)).collect::<Vec<_>>().join(", ");
+    content.push_str(&format!(
+        "\n[modes.{}]\nrequires = [{}]\nbudget = \"{}\"\nwatches = \"{}\"\n",
+        name, requires_str, budget, watches
+    ));
+    std::fs::create_dir_all(config_dir).ok();
+    std::fs::write(&toml_path, &content).ok();
+
+    let agents_dir = config_dir.join("agents");
+    std::fs::create_dir_all(&agents_dir).ok();
+    let agent_toml = format!(r#"[agent]
+name = "{name}"
+artifact_type = "code"
+interactive = "background"
+team = true
+ar_gated = true
+thinking_mode = "{name}"
+
+[prompt]
+identity = """
+You are a {name} agent.
+"""
+
+instructions = """
+Follow the active principles. Cite evidence. Challenge your reasoning.
+"""
+
+[warnings]
+mode = []
+
+[shutdown]
+instruction = """
+When you receive a shutdown_request message, use the SendMessage tool
+to reply to the team lead with this exact JSON as the message parameter:
+{{"type": "shutdown_response", "request_id": "[request_id]", "approve": true}}
+Do NOT print this as text. You MUST use the SendMessage tool. Then stop all work.
+"""
+"#);
+    std::fs::write(agents_dir.join(format!("{}.toml", name)), &agent_toml).ok();
+
+    ok_response(id, &format!("Mode '{}' added (budget: {}). Agent auto-created.", name, budget))
+}
+
+fn configure_remove_mode(id: Value, arguments: &Value, config_dir: &std::path::Path) -> Value {
+    let name = match arguments.get("name").and_then(|n| n.as_str()) {
+        Some(n) => n.to_owned(),
+        None => return jsonrpc_error(Some(id), -32602, "Missing required argument: name"),
+    };
+
+    let toml_path = config_dir.join("feldspar.toml");
+    let content = std::fs::read_to_string(&toml_path).unwrap_or_default();
+
+    let mut val: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => toml::Value::Table(Default::default()),
+    };
+
+    let removed = val.get_mut("modes")
+        .and_then(|m| m.as_table_mut())
+        .map(|modes| modes.remove(&name).is_some())
+        .unwrap_or(false);
+
+    if !removed {
+        return jsonrpc_error(Some(id), -32602, &format!("Mode '{}' not found", name));
+    }
+
+    let serialized = toml::to_string_pretty(&val).unwrap_or_default();
+    std::fs::write(&toml_path, &serialized).ok();
+
+    std::fs::remove_file(config_dir.join("agents").join(format!("{}.toml", name))).ok();
+
+    ok_response(id, &format!("Mode '{}' removed", name))
+}
+
+fn handle_tools_list(is_teammate: bool, has_prefix: bool, id: Value) -> Value {
+    let mut tools = vec![sequentialthinking_tool_def()];
+    if is_teammate {
+        tools.push(temper_tool_def());
+        if has_prefix {
+            tools.push(submit_tool_def());
+            tools.push(judge_tool_def());
+        }
+    } else {
+        tools.push(configure_tool_def());
     }
     jsonrpc_result(id, json!({ "tools": tools }))
 }
@@ -509,6 +824,7 @@ async fn handle_tools_call(state: &McpState, headers: &HeaderMap, id: Value, par
                 None => jsonrpc_error(Some(id), -32602, &format!("Unknown agent role: {}", role)),
             }
         }
+        "configure" => handle_configure(state, id, &params),
         "submit" => handle_submit(state, headers, id, Some(params)).await,
         "judge" => handle_judge(state, headers, id, Some(params)).await,
         "sequentialthinking" => {
@@ -785,8 +1101,8 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new())),
             None,
         );
-        let agent_defs = crate::agents::load_agents();
-        let state = Arc::new(McpState::new(server, agent_defs, None));
+        let agent_defs = crate::agents::load_agents("test");
+        let state = Arc::new(McpState::new(server, agent_defs, None, "test".into()));
         create_router(state)
     }
 
@@ -1036,8 +1352,43 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
     }
 
+    #[test]
+    fn test_tools_list_orchestrator() {
+        // is_teammate=false, has_prefix=false → configure in list, no temper
+        let result = handle_tools_list(false, false, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"configure"), "configure not in orchestrator tools list");
+        assert!(!names.contains(&"temper"), "temper should not be in orchestrator tools list");
+    }
+
+    #[test]
+    fn test_tools_list_teammate_no_prefix() {
+        // is_teammate=true, has_prefix=false → temper in list, no configure, no submit/judge
+        let result = handle_tools_list(true, false, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"temper"), "temper not in teammate tools list");
+        assert!(!names.contains(&"configure"), "configure should not be in teammate tools list");
+        assert!(!names.contains(&"submit"));
+    }
+
+    #[test]
+    fn test_tools_list_teammate_with_prefix() {
+        // is_teammate=true, has_prefix=true → all 4 tools
+        let result = handle_tools_list(true, true, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"sequentialthinking"));
+        assert!(names.contains(&"temper"));
+        assert!(names.contains(&"submit"));
+        assert!(names.contains(&"judge"));
+    }
+
     #[tokio::test]
-    async fn test_tools_list_has_temper() {
+    async fn test_tools_list_teammate() {
+        // With CLAUDE_CODE_TEAM_NAME → teammate sees temper, not configure
+        unsafe { std::env::set_var("CLAUDE_CODE_TEAM_NAME", "test-team"); }
         let (app, session_id) = initialized_app().await;
         let resp = post_mcp_with_session(
             app,
@@ -1045,10 +1396,13 @@ mod tests {
             &session_id,
         )
         .await;
+        unsafe { std::env::remove_var("CLAUDE_CODE_TEAM_NAME"); }
         let body = body_json(resp).await;
         let tools = body["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"temper"), "temper not in tools list");
+        assert!(names.contains(&"temper"), "temper not in teammate tools list");
+        assert!(!names.contains(&"configure"), "configure should not be in teammate tools list");
+        assert!(!names.contains(&"submit"), "submit should not appear before temper called");
     }
 
     #[tokio::test]
@@ -1313,34 +1667,22 @@ mod tests {
 
     // --- AR tools tests ---
 
-    #[tokio::test]
-    async fn test_tools_list_without_session_shows_base() {
-        let app = test_app();
-        let resp = post_mcp(
-            app,
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        let tools = body["result"]["tools"].as_array().unwrap();
+    #[test]
+    fn test_tools_list_orchestrator_has_two_tools() {
+        // Orchestrator: sequentialthinking + configure, nothing else
+        let result = handle_tools_list(false, false, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"sequentialthinking"));
-        assert!(names.contains(&"temper"));
+        assert!(names.contains(&"configure"));
     }
 
-    #[tokio::test]
-    async fn test_tools_list_before_temper_shows_base() {
-        let (app, session_id) = initialized_app().await;
-        let resp = post_mcp_with_session(
-            app,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
-            &session_id,
-        )
-        .await;
-        let body = body_json(resp).await;
-        let tools = body["result"]["tools"].as_array().unwrap();
+    #[test]
+    fn test_tools_list_before_temper_shows_base() {
+        // Orchestrator without prefix → 2 tools (sequentialthinking + configure)
+        let result = handle_tools_list(false, false, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
     }
 
@@ -1361,21 +1703,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_list_after_temper_shows_all() {
+        // Teammate context: with CLAUDE_CODE_TEAM_NAME, after temper → 4 tools
+        unsafe { std::env::set_var("CLAUDE_CODE_TEAM_NAME", "test-team"); }
         let (app, session_id) = initialized_app().await;
-        // Call temper
         post_mcp_with_session(
             app.clone(),
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
             &session_id,
         )
         .await;
-        // Now tools/list should show 4 tools
         let resp = post_mcp_with_session(
             app,
             r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
             &session_id,
         )
         .await;
+        unsafe { std::env::remove_var("CLAUDE_CODE_TEAM_NAME"); }
         let body = body_json(resp).await;
         let tools = body["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 4);
@@ -1506,5 +1849,151 @@ mod tests {
         let prefix2 = text2.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap();
 
         assert_ne!(prefix1, prefix2, "prefixes must be unique across sessions");
+    }
+
+    // --- Configure tool tests ---
+
+    #[tokio::test]
+    async fn test_configure_list() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"configure","arguments":{"action":"list","level":"project"}}}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(parsed["principles"].is_array());
+        assert!(parsed["modes"].is_array());
+        assert_eq!(parsed["level"], "project");
+    }
+
+    #[tokio::test]
+    async fn test_configure_unknown_action() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"configure","arguments":{"action":"bad","level":"project"}}}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn test_configure_add_group() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path();
+        let args = json!({ "group": "my-rules", "active": true });
+        let result = configure_add_group(json!(1), &args, config_dir);
+        assert!(result.get("error").is_none(), "unexpected error: {:?}", result);
+        let content = std::fs::read_to_string(config_dir.join("principles.toml")).unwrap();
+        assert!(content.contains("[groups.my-rules]"));
+    }
+
+    #[tokio::test]
+    async fn test_configure_add_principle() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path();
+
+        // Add group first
+        let args = json!({ "group": "my-rules", "active": true });
+        configure_add_group(json!(1), &args, config_dir);
+
+        // Add principle
+        let args = json!({ "group": "my-rules", "name": "SRP", "rule": "One thing", "ask": ["Is it one?"] });
+        let result = configure_add_principle(json!(2), &args, config_dir);
+        assert!(result.get("error").is_none(), "unexpected error: {:?}", result);
+
+        let content = std::fs::read_to_string(config_dir.join("principles.toml")).unwrap();
+        assert!(content.contains("[[groups.my-rules.principles]]"));
+        assert!(content.contains("SRP"));
+    }
+
+    #[tokio::test]
+    async fn test_configure_add_principle_no_group() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path();
+
+        let args = json!({ "group": "missing", "name": "SRP", "rule": "One thing" });
+        let result = configure_add_principle(json!(1), &args, config_dir);
+        assert_eq!(result["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn test_configure_activate_deactivate() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path();
+
+        // Add group active=true
+        let args = json!({ "group": "solid", "active": true });
+        configure_add_group(json!(1), &args, config_dir);
+
+        // Deactivate
+        let args = json!({ "group": "solid" });
+        let result = configure_set_active(json!(2), &args, config_dir, false);
+        assert!(result.get("error").is_none(), "deactivate failed: {:?}", result);
+
+        // Read back and verify
+        let content = std::fs::read_to_string(config_dir.join("principles.toml")).unwrap();
+        let val: toml::Value = toml::from_str(&content).unwrap();
+        let active = val["groups"]["solid"]["active"].as_bool().unwrap_or(true);
+        assert!(!active);
+    }
+
+    #[tokio::test]
+    async fn test_configure_add_mode() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path();
+
+        let args = json!({ "name": "data-pipeline", "budget": "standard" });
+        let result = configure_add_mode(json!(1), &args, config_dir);
+        assert!(result.get("error").is_none(), "add_mode failed: {:?}", result);
+
+        let content = std::fs::read_to_string(config_dir.join("feldspar.toml")).unwrap();
+        assert!(content.contains("[modes.data-pipeline]"));
+    }
+
+    #[tokio::test]
+    async fn test_configure_add_mode_creates_agent() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path();
+
+        let args = json!({ "name": "data-pipeline", "budget": "standard" });
+        configure_add_mode(json!(1), &args, config_dir);
+
+        let agent_path = config_dir.join("agents/data-pipeline.toml");
+        assert!(agent_path.exists(), "agent TOML not created");
+        let content = std::fs::read_to_string(&agent_path).unwrap();
+        assert!(content.contains("thinking_mode = \"data-pipeline\""));
+    }
+
+    #[tokio::test]
+    async fn test_configure_remove_mode() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path();
+
+        // Add then remove
+        let args = json!({ "name": "data-pipeline", "budget": "standard" });
+        configure_add_mode(json!(1), &args, config_dir);
+
+        let args = json!({ "name": "data-pipeline" });
+        let result = configure_remove_mode(json!(2), &args, config_dir);
+        assert!(result.get("error").is_none(), "remove_mode failed: {:?}", result);
+
+        let content = std::fs::read_to_string(config_dir.join("feldspar.toml")).unwrap();
+        assert!(!content.contains("[modes.data-pipeline]"));
+        assert!(!config_dir.join("agents/data-pipeline.toml").exists());
     }
 }

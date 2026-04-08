@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 const VALID_REQUIRES: &[&str] = &["components", "evidence", "latency", "confidence"];
@@ -69,7 +70,7 @@ pub struct ComponentsConfig {
     pub valid: Vec<String>,
 }
 
-// Stage 1: raw YAML parse target
+// Stage 1: raw TOML parse target
 #[derive(Debug, Deserialize)]
 struct RawPrinciples {
     groups: HashMap<String, RawPrincipleGroup>,
@@ -109,26 +110,51 @@ impl Config {
         Some((range[0], range[1], tier.clone()))
     }
 
-    pub fn load(toml_path: &str, principles_path: &str) -> Arc<Config> {
-        let toml_str = std::fs::read_to_string(toml_path)
-            .unwrap_or_else(|e| panic!("failed to read config '{}': {}", toml_path, e));
-        let mut config: Config = toml::from_str(&toml_str)
-            .unwrap_or_else(|e| panic!("failed to parse config '{}': {}", toml_path, e));
+    /// Load config from 3-level merge: embedded defaults → user-level → project-level.
+    pub fn load_merged(project_name: &str) -> Arc<Config> {
+        // Level 1: embedded defaults
+        let mut config: Config = toml::from_str(include_str!("../config/feldspar.toml"))
+            .expect("embedded feldspar.toml must parse");
+        let mut principles =
+            load_principles_from_str(include_str!("../config/principles.toml"));
 
-        let principles = load_principles(principles_path);
-        validate(&config, &principles);
+        // Level 2: user-level (optional)
+        let user_dir = crate::init::user_config_dir();
+        if let Some(user_config) = try_load_config(&user_dir.join("feldspar.toml")) {
+            merge_config(&mut config, user_config);
+        }
+        if let Some(user_principles) = try_load_principles(&user_dir.join("principles.toml")) {
+            merge_principles(&mut principles, user_principles);
+        }
+
+        // Level 3: project-level (optional)
+        let project_dir = crate::init::data_dir(project_name).join("config");
+        if let Some(proj_config) = try_load_config(&project_dir.join("feldspar.toml")) {
+            merge_config(&mut config, proj_config);
+        }
+        if let Some(proj_principles) = try_load_principles(&project_dir.join("principles.toml")) {
+            merge_principles(&mut principles, proj_principles);
+        }
+
         config.principles = principles;
+        validate(&config, &config.principles);
         Arc::new(config)
     }
 }
 
-fn load_principles(path: &str) -> Vec<PrincipleGroup> {
-    let toml_str = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("failed to read principles file '{}': {}", path, e));
+fn try_load_config(path: &Path) -> Option<Config> {
+    let content = std::fs::read_to_string(path).ok()?;
+    toml::from_str(&content).ok()
+}
 
-    let raw: RawPrinciples = toml::from_str(&toml_str)
-        .unwrap_or_else(|e| panic!("failed to parse principles TOML '{}': {}", path, e));
+fn try_load_principles(path: &Path) -> Option<Vec<PrincipleGroup>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(load_principles_from_str(&content))
+}
 
+pub fn load_principles_from_str(content: &str) -> Vec<PrincipleGroup> {
+    let raw: RawPrinciples = toml::from_str(content)
+        .unwrap_or_else(|e| panic!("failed to parse principles: {}", e));
     raw.groups
         .into_iter()
         .filter(|(_, group)| group.active)
@@ -138,6 +164,31 @@ fn load_principles(path: &str) -> Vec<PrincipleGroup> {
             principles: group.principles,
         })
         .collect()
+}
+
+fn merge_config(base: &mut Config, overlay: Config) {
+    for (name, mode) in overlay.modes {
+        base.modes.insert(name, mode);
+    }
+    for (name, budget) in overlay.budgets {
+        base.budgets.insert(name, budget);
+    }
+    base.thresholds = overlay.thresholds;
+    if overlay.ar.is_some() {
+        base.ar = overlay.ar;
+    }
+}
+
+fn merge_principles(base: &mut Vec<PrincipleGroup>, overlay: Vec<PrincipleGroup>) {
+    for og in overlay {
+        if let Some(bg) = base.iter_mut().find(|g| g.name == og.name) {
+            bg.active = og.active;
+            bg.principles = og.principles;
+        } else {
+            base.push(og);
+        }
+    }
+    base.retain(|g| g.active);
 }
 
 fn validate(config: &Config, principles: &[PrincipleGroup]) {
@@ -265,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_valid_config_parses() {
-        let config = Config::load("config/feldspar.toml", "config/principles.toml");
+        let config = Config::load_merged("nonexistent-test-project-xyz");
         assert_eq!(config.feldspar.db_path, "feldspar.db");
         assert_eq!(config.feldspar.recap_every, 3);
         assert!(config.modes.contains_key("architecture"));
@@ -275,7 +326,7 @@ mod tests {
 
     #[test]
     fn test_principles_load() {
-        let config = Config::load("config/feldspar.toml", "config/principles.toml");
+        let config = Config::load_merged("nonexistent-test-project-xyz");
         assert!(!config.principles.is_empty());
         let solid = config.principles.iter().find(|g| g.name == "solid");
         assert!(solid.is_some());
@@ -284,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_principles_key_to_name() {
-        let config = Config::load("config/feldspar.toml", "config/principles.toml");
+        let config = Config::load_merged("nonexistent-test-project-xyz");
         let names: Vec<&str> = config.principles.iter().map(|g| g.name.as_str()).collect();
         assert!(names.contains(&"solid"));
         assert!(names.contains(&"kiss-dry"));
@@ -294,8 +345,87 @@ mod tests {
 
     #[test]
     fn test_inactive_groups_excluded() {
-        let config = Config::load("config/feldspar.toml", "config/principles.toml");
+        let config = Config::load_merged("nonexistent-test-project-xyz");
         assert!(config.principles.iter().all(|g| g.name != "security"));
+    }
+
+    #[test]
+    fn test_load_merged_embedded_defaults() {
+        let config = Config::load_merged("nonexistent-project-zzz999");
+        assert!(!config.modes.is_empty());
+        assert!(!config.principles.is_empty());
+        assert!(!config.budgets.is_empty());
+    }
+
+    #[test]
+    fn test_merge_config_modes_override() {
+        let mut base = test_config();
+        let mut overlay = test_config();
+        // Override architecture mode with different budget
+        overlay.modes.insert(
+            "architecture".into(),
+            ModeConfig {
+                requires: vec![],
+                budget: "standard".into(),
+                watches: "overridden".into(),
+            },
+        );
+        merge_config(&mut base, overlay);
+        assert_eq!(base.modes["architecture"].budget, "standard");
+        assert_eq!(base.modes["architecture"].watches, "overridden");
+    }
+
+    #[test]
+    fn test_merge_principles_deactivate() {
+        let mut base = vec![PrincipleGroup {
+            name: "tdd".into(),
+            active: true,
+            principles: vec![Principle {
+                name: "TDD".into(),
+                rule: "test first".into(),
+                ask: vec![],
+            }],
+        }];
+        // Overlay deactivates tdd
+        let overlay = vec![PrincipleGroup {
+            name: "tdd".into(),
+            active: false,
+            principles: vec![],
+        }];
+        merge_principles(&mut base, overlay);
+        assert!(base.iter().all(|g| g.name != "tdd"), "tdd should be excluded");
+    }
+
+    #[test]
+    fn test_merge_principles_add_group() {
+        let mut base = vec![PrincipleGroup {
+            name: "solid".into(),
+            active: true,
+            principles: vec![Principle {
+                name: "SRP".into(),
+                rule: "one reason".into(),
+                ask: vec![],
+            }],
+        }];
+        let overlay = vec![PrincipleGroup {
+            name: "my-rules".into(),
+            active: true,
+            principles: vec![Principle {
+                name: "custom".into(),
+                rule: "my rule".into(),
+                ask: vec![],
+            }],
+        }];
+        merge_principles(&mut base, overlay);
+        assert!(base.iter().any(|g| g.name == "my-rules"), "my-rules should be added");
+    }
+
+    #[test]
+    fn test_load_principles_from_str() {
+        let content = include_str!("../config/principles.toml");
+        let groups = load_principles_from_str(content);
+        assert!(!groups.is_empty());
+        assert!(groups.iter().any(|g| g.name == "solid"));
     }
 
     #[test]
@@ -337,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_llm_config_parses() {
-        let config = Config::load("config/feldspar.toml", "config/principles.toml");
+        let config = Config::load_merged("nonexistent-test-project-xyz");
         assert_eq!(config.llm.model, "openai/gpt-oss-20b:nitro");
     }
 

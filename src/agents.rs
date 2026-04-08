@@ -67,7 +67,25 @@ pub struct AgentDef {
     pub shutdown: String,
 }
 
-pub fn load_agents() -> HashMap<String, AgentDef> {
+fn parse_agent_def(raw: RawAgentToml) -> AgentDef {
+    AgentDef {
+        name: raw.agent.name.clone(),
+        artifact_type: raw.agent.artifact_type,
+        interactive: raw.agent.interactive,
+        team: raw.agent.team,
+        ar_gated: raw.agent.ar_gated,
+        thinking_mode: raw.agent.thinking_mode,
+        prompt: format!(
+            "{}\n\n{}",
+            raw.prompt.identity.trim(),
+            raw.prompt.instructions.trim()
+        ),
+        mode_warnings: raw.warnings.mode,
+        shutdown: raw.shutdown.instruction,
+    }
+}
+
+fn load_embedded_agents() -> HashMap<String, AgentDef> {
     let sources = [
         AGENT_ARM,
         AGENT_SOLVE,
@@ -81,23 +99,43 @@ pub fn load_agents() -> HashMap<String, AgentDef> {
     for src in sources {
         let raw: RawAgentToml = toml::from_str(src)
             .unwrap_or_else(|e| panic!("failed to parse agent TOML: {}", e));
-        let def = AgentDef {
-            name: raw.agent.name.clone(),
-            artifact_type: raw.agent.artifact_type,
-            interactive: raw.agent.interactive,
-            team: raw.agent.team,
-            ar_gated: raw.agent.ar_gated,
-            thinking_mode: raw.agent.thinking_mode,
-            prompt: format!(
-                "{}\n\n{}",
-                raw.prompt.identity.trim(),
-                raw.prompt.instructions.trim()
-            ),
-            mode_warnings: raw.warnings.mode,
-            shutdown: raw.shutdown.instruction,
-        };
-        agents.insert(raw.agent.name, def);
+        let name = raw.agent.name.clone();
+        agents.insert(name, parse_agent_def(raw));
     }
+    agents
+}
+
+fn load_custom_agents(agents: &mut HashMap<String, AgentDef>, dir: &std::path::Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "toml").unwrap_or(false) {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match toml::from_str::<RawAgentToml>(&content) {
+                    Ok(raw) => {
+                        let def = parse_agent_def(raw);
+                        agents.insert(def.name.clone(), def);
+                    }
+                    Err(e) => tracing::warn!("failed to parse agent {:?}: {}", path, e),
+                },
+                Err(e) => tracing::warn!("failed to read agent {:?}: {}", path, e),
+            }
+        }
+    }
+}
+
+pub fn load_agents(project_name: &str) -> HashMap<String, AgentDef> {
+    let mut agents = load_embedded_agents();
+
+    let home = dirs::home_dir().unwrap_or_default();
+    let base = home.join("feldspar/data");
+
+    load_custom_agents(&mut agents, &base.join("config/agents"));
+    load_custom_agents(&mut agents, &base.join(project_name).join("config/agents"));
+
     agents
 }
 
@@ -171,13 +209,13 @@ mod tests {
 
     #[test]
     fn test_all_agent_tomls_parse() {
-        let agents = load_agents();
+        let agents = load_agents("test");
         assert_eq!(agents.len(), 7);
     }
 
     #[test]
     fn test_agent_names() {
-        let agents = load_agents();
+        let agents = load_agents("test");
         let expected = ["arm", "solve", "breakdown", "build", "bugfest", "ar", "pmatch"];
         for name in &expected {
             assert!(agents.contains_key(*name), "missing agent: {}", name);
@@ -186,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_agent_fields_populated() {
-        let agents = load_agents();
+        let agents = load_agents("test");
         for (name, def) in &agents {
             assert!(!def.name.is_empty(), "{}: name is empty", name);
             assert!(!def.thinking_mode.is_empty(), "{}: thinking_mode is empty", name);
@@ -263,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_temper_includes_principles() {
-        let agents = load_agents();
+        let agents = load_agents("test");
         let agent = agents.get("build").unwrap();
         let config = test_config_with_principles();
         let output = temper(agent, &config, "test");
@@ -274,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_temper_includes_warnings() {
-        let agents = load_agents();
+        let agents = load_agents("test");
         let agent = agents.get("build").unwrap();
         let config = test_config_empty_principles();
         let output = temper(agent, &config, "test");
@@ -284,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_temper_includes_shutdown() {
-        let agents = load_agents();
+        let agents = load_agents("test");
         let agent = agents.get("build").unwrap();
         let config = test_config_empty_principles();
         let output = temper(agent, &config, "test");
@@ -293,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_temper_empty_principles() {
-        let agents = load_agents();
+        let agents = load_agents("test");
         let agent = agents.get("build").unwrap();
         let config = test_config_empty_principles();
         let output = temper(agent, &config, "test");
@@ -325,8 +363,93 @@ mod tests {
     }
 
     #[test]
+    fn test_load_agents_embedded_only() {
+        // Nonexistent project → only 7 embedded agents returned
+        let agents = load_agents("__nonexistent_project_for_test__");
+        assert_eq!(agents.len(), 7, "expected exactly 7 embedded agents");
+    }
+
+    #[test]
+    fn test_load_custom_agents_from_dir() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let agent_toml = r#"
+[agent]
+name = "custom-test"
+artifact_type = "code"
+interactive = "background"
+team = true
+ar_gated = false
+thinking_mode = "custom"
+
+[prompt]
+identity = "Custom test agent."
+instructions = "Do the thing."
+
+[warnings]
+mode = []
+
+[shutdown]
+instruction = "Send shutdown_response."
+"#;
+        std::fs::write(tmp.path().join("custom-test.toml"), agent_toml).unwrap();
+
+        let mut agents = HashMap::new();
+        load_custom_agents(&mut agents, tmp.path());
+
+        assert_eq!(agents.len(), 1);
+        assert!(agents.contains_key("custom-test"));
+    }
+
+    #[test]
+    fn test_custom_agent_overrides_embedded() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        // Write agent named "build" to override embedded
+        let agent_toml = r#"
+[agent]
+name = "build"
+artifact_type = "docs"
+interactive = "foreground"
+team = false
+ar_gated = false
+thinking_mode = "custom-build"
+
+[prompt]
+identity = "Custom build override."
+instructions = "Custom instructions."
+
+[warnings]
+mode = ["CUSTOM_WARNING"]
+
+[shutdown]
+instruction = "Custom shutdown."
+"#;
+        std::fs::write(tmp.path().join("build.toml"), agent_toml).unwrap();
+
+        let mut agents = load_embedded_agents();
+        load_custom_agents(&mut agents, tmp.path());
+
+        let build = agents.get("build").unwrap();
+        assert_eq!(build.thinking_mode, "custom-build", "custom agent should override embedded");
+        assert_eq!(build.artifact_type, "docs");
+    }
+
+    #[test]
+    fn test_invalid_custom_toml_skipped() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("bad.toml"), "not valid toml [[[[").unwrap();
+
+        let mut agents = HashMap::new();
+        // Should not panic
+        load_custom_agents(&mut agents, tmp.path());
+        assert_eq!(agents.len(), 0);
+    }
+
+    #[test]
     fn test_temper_includes_prefix() {
-        let agents = load_agents();
+        let agents = load_agents("test");
         let agent = agents.get("build").unwrap();
         let config = test_config_empty_principles();
         let output = temper(agent, &config, "ab12");
@@ -335,7 +458,7 @@ mod tests {
 
     #[test]
     fn test_temper_ar_gated_has_artifact_protocol() {
-        let agents = load_agents();
+        let agents = load_agents("test");
         let agent = agents.get("build").unwrap();
         assert!(agent.ar_gated, "build agent must be ar_gated for this test");
         let config = test_config_empty_principles();
@@ -347,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_temper_non_ar_gated_no_artifact_protocol() {
-        let agents = load_agents();
+        let agents = load_agents("test");
         let agent = agents.get("arm").unwrap();
         assert!(!agent.ar_gated, "arm agent must not be ar_gated for this test");
         let config = test_config_empty_principles();

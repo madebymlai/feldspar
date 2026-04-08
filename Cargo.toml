@@ -36,6 +36,9 @@ bincode = { version = "2", features = ["serde"] }
 # Config
 toml = "0.8"
 
+# Home directory resolution
+dirs = "5"
+
 # Prefix generation
 rand = "0.8"
 

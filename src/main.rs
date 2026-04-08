@@ -3,6 +3,7 @@ mod analyzers;
 mod ar;
 mod config;
 mod db;
+mod init;
 mod llm;
 mod mcp;
 mod ml;
@@ -33,6 +34,15 @@ enum Commands {
         /// Port to listen on
         #[arg(long, default_value = "3581")]
         port: u16,
+        /// Project name (used to locate data dir and config)
+        #[arg(long)]
+        project: String,
+    },
+    /// Initialize feldspar for a project
+    Init {
+        /// Project name override (default: git root basename or cwd basename)
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Hook subcommands (invoked by Claude Code hooks)
     Hook {
@@ -45,6 +55,8 @@ enum Commands {
 enum HookAction {
     /// Record file changes for AR evaluation
     RecordChange,
+    /// Run session start tasks
+    SessionStart,
 }
 
 #[tokio::main]
@@ -58,11 +70,19 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { daemon, port } => {
+        Commands::Init { project } => {
+            let project_name = init::detect_project_name(project.as_deref());
+            println!("Initializing feldspar for project: {}", project_name);
+            init::create_data_dirs(&project_name).expect("failed to create data dirs");
+            let api_key = init::prompt_api_key();
+            let project_dir = std::env::current_dir().expect("failed to get cwd");
+            init::run_init(&project_name, &project_dir, &api_key).expect("init failed");
+        }
+        Commands::Start { daemon, port, project } => {
             if daemon {
                 let exe = std::env::current_exe().expect("failed to get executable path");
                 std::process::Command::new(exe)
-                    .args(["start", "--port", &port.to_string()])
+                    .args(["start", "--port", &port.to_string(), "--project", &project])
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -72,10 +92,11 @@ async fn main() {
                 return;
             }
 
-            run_server(port).await;
+            run_server(port, &project).await;
         }
         Commands::Hook { action } => match action {
             HookAction::RecordChange => record_change(),
+            HookAction::SessionStart => session_start(),
         },
     }
 }
@@ -125,8 +146,12 @@ fn record_change() {
     }
 }
 
-async fn run_server(port: u16) {
-    let config = config::Config::load("config/feldspar.toml", "config/principles.toml");
+fn session_start() {
+    // Best-effort session start hook — currently a no-op placeholder
+}
+
+async fn run_server(port: u16, project: &str) {
+    let config = config::Config::load_merged(project);
     let llm = llm::LlmClient::new(&config.llm);
 
     // DB init — best-effort
@@ -180,7 +205,7 @@ async fn run_server(port: u16) {
     };
     let ml = ml.map(Arc::new);
 
-    let agent_defs = agents::load_agents();
+    let agent_defs = agents::load_agents(project);
     info!(count = agent_defs.len(), "loaded agent definitions");
 
     let ar_engine = config.ar.as_ref().and_then(|ac| ar::ArEngine::new(ac));
@@ -192,7 +217,7 @@ async fn run_server(port: u16) {
 
     let leaf_cache_for_prune = leaf_cache.clone();
     let server = thought::ThinkingServer::new(config, llm, db.clone(), leaf_cache, ml.clone());
-    let state = Arc::new(mcp::McpState::new(server, agent_defs, ar_engine));
+    let state = Arc::new(mcp::McpState::new(server, agent_defs, ar_engine, project.to_owned()));
 
     let cleanup_state = state.clone();
     tokio::spawn(mcp::session_cleanup_task(cleanup_state));

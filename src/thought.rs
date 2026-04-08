@@ -1111,7 +1111,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_new() {
-        let config = Config::load("config/feldspar.toml", "config/principles.toml");
+        let config = Config::load_merged("nonexistent-test-project-xyz");
         let server = ThinkingServer::new(config, None, None, Arc::new(RwLock::new(HashMap::new())), None);
         assert!(server.db.is_none());
         assert!(server.ml.is_none());
