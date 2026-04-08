@@ -319,7 +319,7 @@ mod tests {
         let config = Config::load_merged("nonexistent-test-project-xyz");
         assert_eq!(config.feldspar.db_path, "feldspar.db");
         assert_eq!(config.feldspar.recap_every, 3);
-        assert!(config.modes.contains_key("architecture"));
+        assert!(config.modes.contains_key("problem-solving"));
         assert!(config.budgets.contains_key("deep"));
         assert_eq!(config.thresholds.confidence_gap, 25.0);
     }
@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn test_llm_config_parses() {
         let config = Config::load_merged("nonexistent-test-project-xyz");
-        assert_eq!(config.llm.model, "openai/gpt-oss-20b:nitro");
+        assert!(!config.llm.model.is_empty());
     }
 
     fn minimal_toml(llm_section: &str) -> String {

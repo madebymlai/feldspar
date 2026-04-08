@@ -33,6 +33,7 @@ pub struct Session {
     pub last_activity: Timestamp,
     pub prefix: Option<String>,
     pub thinking_mode: Option<String>,
+    pub ar_gated: bool,
     pub judge_cycle: u32,
 }
 
@@ -277,16 +278,16 @@ async fn dispatch_message(
         }
         "tools/list" => {
             let is_teammate = std::env::var("CLAUDE_CODE_TEAM_NAME").is_ok();
-            let has_prefix = if !is_teammate {
-                false
+            let (has_prefix, is_ar_gated) = if !is_teammate {
+                (false, false)
             } else if let Ok(sid) = validate_session(state, headers).await {
                 state.sessions.read().await.get(&sid)
-                    .map(|s| s.prefix.is_some())
-                    .unwrap_or(false)
+                    .map(|s| (s.prefix.is_some(), s.ar_gated))
+                    .unwrap_or((false, false))
             } else {
-                false
+                (false, false)
             };
-            DispatchResult::Response(handle_tools_list(is_teammate, has_prefix, id), None)
+            DispatchResult::Response(handle_tools_list(is_teammate, has_prefix, is_ar_gated, id), None)
         }
         "tools/call" => DispatchResult::Response(handle_tools_call(state, headers, id, params).await, None),
         "ping" => DispatchResult::Response(jsonrpc_result(id, json!({})), None),
@@ -329,6 +330,7 @@ async fn handle_initialize(
             last_activity: now,
             prefix: None,
             thinking_mode: None,
+            ar_gated: false,
             judge_cycle: 0,
         },
     );
@@ -761,13 +763,15 @@ fn configure_remove_mode(id: Value, arguments: &Value, config_dir: &std::path::P
     ok_response(id, &format!("Mode '{}' removed", name))
 }
 
-fn handle_tools_list(is_teammate: bool, has_prefix: bool, id: Value) -> Value {
+fn handle_tools_list(is_teammate: bool, has_prefix: bool, is_ar_gated: bool, id: Value) -> Value {
     let mut tools = vec![sequentialthinking_tool_def()];
     if is_teammate {
         tools.push(temper_tool_def());
         if has_prefix {
             tools.push(submit_tool_def());
-            tools.push(judge_tool_def());
+            if is_ar_gated {
+                tools.push(judge_tool_def());
+            }
         }
     } else {
         tools.push(configure_tool_def());
@@ -809,6 +813,7 @@ async fn handle_tools_call(state: &McpState, headers: &HeaderMap, id: Value, par
                         if let Some(session) = sessions.get_mut(&session_id) {
                             session.prefix = Some(prefix.clone());
                             session.thinking_mode = Some(agent.thinking_mode.clone());
+                            session.ar_gated = agent.ar_gated;
                             session.judge_cycle = 0;
                         }
                     }
@@ -1354,8 +1359,8 @@ mod tests {
 
     #[test]
     fn test_tools_list_orchestrator() {
-        // is_teammate=false, has_prefix=false → configure in list, no temper
-        let result = handle_tools_list(false, false, json!(1));
+        // is_teammate=false → configure in list, no temper
+        let result = handle_tools_list(false, false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"configure"), "configure not in orchestrator tools list");
@@ -1364,8 +1369,8 @@ mod tests {
 
     #[test]
     fn test_tools_list_teammate_no_prefix() {
-        // is_teammate=true, has_prefix=false → temper in list, no configure, no submit/judge
-        let result = handle_tools_list(true, false, json!(1));
+        // is_teammate=true, has_prefix=false → temper only
+        let result = handle_tools_list(true, false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"temper"), "temper not in teammate tools list");
@@ -1374,15 +1379,25 @@ mod tests {
     }
 
     #[test]
-    fn test_tools_list_teammate_with_prefix() {
-        // is_teammate=true, has_prefix=true → all 4 tools
-        let result = handle_tools_list(true, true, json!(1));
+    fn test_tools_list_teammate_with_prefix_ar_gated() {
+        // is_teammate=true, has_prefix=true, ar_gated=true → submit + judge
+        let result = handle_tools_list(true, true, true, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"sequentialthinking"));
         assert!(names.contains(&"temper"));
         assert!(names.contains(&"submit"));
         assert!(names.contains(&"judge"));
+    }
+
+    #[test]
+    fn test_tools_list_teammate_with_prefix_not_ar_gated() {
+        // is_teammate=true, has_prefix=true, ar_gated=false → submit only, no judge
+        let result = handle_tools_list(true, true, false, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"submit"));
+        assert!(!names.contains(&"judge"));
     }
 
     #[tokio::test]
@@ -1670,7 +1685,7 @@ mod tests {
     #[test]
     fn test_tools_list_orchestrator_has_two_tools() {
         // Orchestrator: sequentialthinking + configure, nothing else
-        let result = handle_tools_list(false, false, json!(1));
+        let result = handle_tools_list(false, false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -1681,7 +1696,7 @@ mod tests {
     #[test]
     fn test_tools_list_before_temper_shows_base() {
         // Orchestrator without prefix → 2 tools (sequentialthinking + configure)
-        let result = handle_tools_list(false, false, json!(1));
+        let result = handle_tools_list(false, false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
     }

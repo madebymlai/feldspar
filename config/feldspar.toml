@@ -7,7 +7,7 @@ pattern_recall_top_k = 3
 [llm]
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
-model = "openai/gpt-oss-20b:nitro"
+model = "google/gemini-2.5-flash-lite"
 
 [thresholds]
 confidence_gap = 25
@@ -26,11 +26,6 @@ deep = [5, 8]
 requires = []
 budget = "standard"
 watches = "Must extract requirements not solutions, must probe gaps, must not jump to how"
-
-[modes.architecture]
-requires = ["components"]
-budget = "deep"
-watches = "Must name components, must estimate impact, must explore alternatives"
 
 [modes.problem-solving]
 requires = ["evidence"]
@@ -68,5 +63,5 @@ valid = []  # populate per project
 [ar]
 threshold = 90
 max_retries = 3
-principles_model = "z-ai/glm-4.7-flash"
-adversarial_model = "openai/gpt-oss-120b:nitro"
+principles_model = "google/gemini-2.5-flash-lite"
+adversarial_model = "google/gemini-2.5-flash-lite"
