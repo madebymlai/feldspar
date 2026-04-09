@@ -174,17 +174,8 @@ fn session_start() {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
-    // Check hook input for teammate detection
-    let hook_data: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
-    let is_teammate = hook_data.get("agent_type").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false)
-        || hook_data.get("agent_id").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
-
-    if is_teammate {
-        return;
-    }
-
-    // Inject orchestrator context (main session only)
-    let context = include_str!("../hooks/scripts/orchestrator-context.md");
+    // Inject context telling the session to call temper("orchestrator")
+    let context = "You have the feldspar MCP server connected. Call the `temper` tool with your role to get your instructions. If you have no role assigned, use role `orchestrator`.";
     let escaped = context
         .replace('\\', "\\\\")
         .replace('"', "\\\"")

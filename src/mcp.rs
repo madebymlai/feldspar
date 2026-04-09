@@ -377,17 +377,14 @@ async fn dispatch_message(
             DispatchResult::Response(response, Some(session_id))
         }
         "tools/list" => {
-            let is_teammate = std::env::var("CLAUDE_CODE_TEAM_NAME").is_ok();
-            let (has_prefix, is_ar_gated) = if !is_teammate {
-                (false, false)
-            } else if let Ok(sid) = validate_session(state, headers).await {
+            let (has_prefix, is_ar_gated) = if let Ok(sid) = validate_session(state, headers).await {
                 state.sessions.read().await.get(&sid)
                     .map(|s| (s.prefix.is_some(), s.ar_gated))
                     .unwrap_or((false, false))
             } else {
                 (false, false)
             };
-            DispatchResult::Response(handle_tools_list(is_teammate, has_prefix, is_ar_gated, id), None)
+            DispatchResult::Response(handle_tools_list(has_prefix, is_ar_gated, id), None)
         }
         "tools/call" => DispatchResult::Response(handle_tools_call(state, headers, id, params).await, None),
         "ping" => DispatchResult::Response(jsonrpc_result(id, json!({})), None),
@@ -951,19 +948,16 @@ fn configure_remove_mode(id: Value, arguments: &Value, config_dir: &std::path::P
     ok_response(id, &format!("Mode '{}' removed", name))
 }
 
-fn handle_tools_list(is_teammate: bool, has_prefix: bool, is_ar_gated: bool, id: Value) -> Value {
+fn handle_tools_list(has_prefix: bool, is_ar_gated: bool, id: Value) -> Value {
     let mut tools = vec![sequentialthinking_tool_def()];
-    if is_teammate {
-        tools.push(temper_tool_def());
-        if has_prefix {
-            tools.push(submit_tool_def());
-            tools.push(fetch_tool_def());
-            if is_ar_gated {
-                tools.push(judge_tool_def());
-            }
+    tools.push(temper_tool_def());
+    tools.push(configure_tool_def());
+    if has_prefix {
+        tools.push(submit_tool_def());
+        tools.push(fetch_tool_def());
+        if is_ar_gated {
+            tools.push(judge_tool_def());
         }
-    } else {
-        tools.push(configure_tool_def());
     }
     jsonrpc_result(id, json!({ "tools": tools }))
 }
@@ -1560,59 +1554,42 @@ mod tests {
     }
 
     #[test]
-    fn test_tools_list_orchestrator() {
-        // is_teammate=false → configure in list, no temper
-        let result = handle_tools_list(false, false, false, json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"configure"), "configure not in orchestrator tools list");
-        assert!(!names.contains(&"temper"), "temper should not be in orchestrator tools list");
-    }
-
-    #[test]
-    fn test_tools_list_teammate_no_prefix() {
-        // is_teammate=true, has_prefix=false → temper only
-        let result = handle_tools_list(true, false, false, json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"temper"), "temper not in teammate tools list");
-        assert!(!names.contains(&"configure"), "configure should not be in teammate tools list");
-        assert!(!names.contains(&"submit"));
-    }
-
-    #[test]
-    fn test_tools_list_teammate_with_prefix_ar_gated() {
-        // is_teammate=true, has_prefix=true, ar_gated=true → submit + fetch + judge
-        let result = handle_tools_list(true, true, true, json!(1));
+    fn test_tools_list_no_prefix() {
+        // No prefix → temper + configure, no submit/fetch/judge
+        let result = handle_tools_list(false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"sequentialthinking"));
         assert!(names.contains(&"temper"));
+        assert!(names.contains(&"configure"));
+        assert!(!names.contains(&"submit"));
+        assert!(!names.contains(&"fetch"));
+        assert!(!names.contains(&"judge"));
+    }
+
+    #[test]
+    fn test_tools_list_with_prefix_ar_gated() {
+        // has_prefix=true, ar_gated=true → submit + fetch + judge
+        let result = handle_tools_list(true, true, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"sequentialthinking"));
+        assert!(names.contains(&"temper"));
+        assert!(names.contains(&"configure"));
         assert!(names.contains(&"submit"));
         assert!(names.contains(&"fetch"));
         assert!(names.contains(&"judge"));
     }
 
     #[test]
-    fn test_tools_list_teammate_with_prefix_not_ar_gated() {
-        // is_teammate=true, has_prefix=true, ar_gated=false → submit + fetch, no judge
-        let result = handle_tools_list(true, true, false, json!(1));
+    fn test_tools_list_with_prefix_not_ar_gated() {
+        // has_prefix=true, ar_gated=false → submit + fetch, no judge
+        let result = handle_tools_list(true, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"submit"));
         assert!(names.contains(&"fetch"));
         assert!(!names.contains(&"judge"));
-    }
-
-    #[test]
-    fn test_tools_list_teammate() {
-        // With is_teammate=true and no prefix → temper only (no configure, no submit)
-        let result = handle_tools_list(true, false, false, json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"temper"), "temper not in teammate tools list");
-        assert!(!names.contains(&"configure"), "configure should not be in teammate tools list");
-        assert!(!names.contains(&"submit"), "submit should not appear before temper called");
     }
 
     #[tokio::test]
@@ -1878,22 +1855,15 @@ mod tests {
     // --- AR tools tests ---
 
     #[test]
-    fn test_tools_list_orchestrator_has_two_tools() {
-        // Orchestrator: sequentialthinking + configure, nothing else
-        let result = handle_tools_list(false, false, false, json!(1));
+    fn test_tools_list_base_tools() {
+        // No prefix → 3 base tools (sequentialthinking + temper + configure)
+        let result = handle_tools_list(false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"sequentialthinking"));
+        assert!(names.contains(&"temper"));
         assert!(names.contains(&"configure"));
-    }
-
-    #[test]
-    fn test_tools_list_before_temper_shows_base() {
-        // Orchestrator without prefix → 2 tools (sequentialthinking + configure)
-        let result = handle_tools_list(false, false, false, json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2);
     }
 
     #[tokio::test]
@@ -1913,8 +1883,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_list_after_temper_shows_all() {
-        // Teammate context: with CLAUDE_CODE_TEAM_NAME, after temper → 4 tools
-        unsafe { std::env::set_var("CLAUDE_CODE_TEAM_NAME", "test-team"); }
+        // After temper → base tools + submit + fetch + judge (build is ar_gated)
         let (app, session_id) = initialized_app().await;
         post_mcp_with_session(
             app.clone(),
@@ -1928,11 +1897,12 @@ mod tests {
             &session_id,
         )
         .await;
-        unsafe { std::env::remove_var("CLAUDE_CODE_TEAM_NAME"); }
         let body = body_json(resp).await;
         let tools = body["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"temper"));
+        assert!(names.contains(&"configure"));
         assert!(names.contains(&"submit"));
         assert!(names.contains(&"fetch"));
         assert!(names.contains(&"judge"));
@@ -2325,19 +2295,19 @@ user_story = "As a user, I want to log in"
     // --- Tools list: teammate has fetch (Task 4) ---
 
     #[test]
-    fn test_tools_list_teammate_has_fetch() {
-        let result = handle_tools_list(true, true, false, json!(1));
+    fn test_tools_list_with_prefix_has_fetch() {
+        let result = handle_tools_list(true, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"fetch"), "fetch not in tempered teammate tools");
+        assert!(names.contains(&"fetch"), "fetch not in tempered session tools");
     }
 
     #[test]
-    fn test_tools_list_orchestrator_no_fetch() {
-        let result = handle_tools_list(false, false, false, json!(1));
+    fn test_tools_list_no_prefix_no_fetch() {
+        let result = handle_tools_list(false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"fetch"), "fetch must not appear in orchestrator tools");
+        assert!(!names.contains(&"fetch"), "fetch must not appear without prefix");
     }
 
     // --- Fetch tool tests (Task 3) ---
