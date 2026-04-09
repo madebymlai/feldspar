@@ -16,10 +16,10 @@ You delegate, you don't solve. Each skill has a specialist teammate with its own
 
 ## Spawning Teammates
 
-When spawning a feldspar teammate:
+When spawning a feldspar teammate, always use latest sonnet version, and as prompt ONLY:
 
 ```
-Your role is [role]. Prefix: [prefix].
+Your role is [role]. Prefix: [prefix]. run temper MCP with your role and prefix.
 ```
 
 For build agents, also include the group assignment:

@@ -148,7 +148,53 @@ fn record_change() {
 }
 
 fn session_start() {
-    // Best-effort session start hook — currently a no-op placeholder
+    // Read hook input from stdin
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).ok();
+
+    // Auto-start daemon if not running
+    let health = std::process::Command::new("curl")
+        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "http://localhost:3581/health"])
+        .output();
+    let running = health
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s == "200")
+        .unwrap_or(false);
+
+    if !running {
+        let project = init::detect_project_name(None);
+        let exe = std::env::current_exe().unwrap_or_default();
+        let _ = std::process::Command::new(exe)
+            .args(["start", "--project", &project, "--daemon"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    // Check hook input for teammate detection
+    let hook_data: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+    let is_teammate = hook_data.get("agent_type").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false)
+        || hook_data.get("agent_id").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+
+    if is_teammate {
+        return;
+    }
+
+    // Inject orchestrator context (main session only)
+    let context = include_str!("../hooks/scripts/orchestrator-context.md");
+    let escaped = context
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    println!(
+        "{{\n  \"hookSpecificOutput\": {{\n    \"hookEventName\": \"SessionStart\",\n    \"additionalContext\": \"{}\"\n  }}\n}}",
+        escaped
+    );
 }
 
 async fn run_server(port: u16, project: &str) {
@@ -218,7 +264,7 @@ async fn run_server(port: u16, project: &str) {
 
     let leaf_cache_for_prune = leaf_cache.clone();
     let server = thought::ThinkingServer::new(config, llm, db.clone(), leaf_cache, ml.clone());
-    let state = Arc::new(mcp::McpState::new(server, agent_defs, ar_engine, project.to_owned()));
+    let state = Arc::new(mcp::McpState::new(server, agent_defs, ar_engine, project.to_owned(), port));
 
     let cleanup_state = state.clone();
     tokio::spawn(mcp::session_cleanup_task(cleanup_state));
