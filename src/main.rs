@@ -75,9 +75,16 @@ async fn main() {
             let project_name = init::detect_project_name(project.as_deref());
             println!("Initializing feldspar for project: {}", project_name);
             init::create_data_dirs(&project_name).expect("failed to create data dirs");
-            let api_key = init::prompt_api_key();
             let project_dir = std::env::current_dir().expect("failed to get cwd");
+            let api_key = init::existing_api_key(&project_dir).unwrap_or_default();
             init::run_init(&project_name, &project_dir, &api_key).expect("init failed");
+            if api_key.is_empty() {
+                println!(
+                    "\nNote: OPENROUTER_API_KEY is empty in .mcp.json.\n\
+                     Edit .mcp.json to add your key before starting a session.\n\
+                     Get one at https://openrouter.ai"
+                );
+            }
         }
         Commands::Start { daemon, port, project } => {
             if daemon {

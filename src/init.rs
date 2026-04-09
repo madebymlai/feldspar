@@ -51,21 +51,17 @@ pub fn create_data_dirs(project_name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn prompt_api_key() -> String {
-    use std::io::{self, BufRead, Write};
-    loop {
-        print!("OpenRouter API key (required): ");
-        io::stdout().flush().ok();
-        let mut key = String::new();
-        io::stdin().lock().read_line(&mut key).ok();
-        let key = key.trim().to_owned();
-        if !key.is_empty() {
-            return key;
-        }
-        println!(
-            "API key is required for AR quality gate. Get one at https://openrouter.ai"
-        );
-    }
+pub fn existing_api_key(project_dir: &Path) -> Option<String> {
+    let mcp_path = project_dir.join(".mcp.json");
+    let content = std::fs::read_to_string(&mcp_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    v.get("mcpServers")?
+        .get("feldspar")?
+        .get("env")?
+        .get("OPENROUTER_API_KEY")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
 }
 
 pub fn run_init(project_name: &str, project_dir: &Path, api_key: &str) -> Result<(), String> {
@@ -130,16 +126,18 @@ fn write_mcp_json(project_dir: &Path, project_name: &str, api_key: &str) -> Resu
         .unwrap()
         .entry("mcpServers")
         .or_insert_with(|| json!({}));
-    servers.as_object_mut().unwrap().insert(
-        "feldspar".into(),
-        json!({
-            "command": "feldspar",
-            "args": ["start", "--project", project_name],
-            "env": {
-                "OPENROUTER_API_KEY": api_key
-            }
-        }),
-    );
+    let feldspar = servers
+        .as_object_mut()
+        .unwrap()
+        .entry("feldspar")
+        .or_insert_with(|| json!({}));
+    let obj = feldspar.as_object_mut().unwrap();
+    obj.insert("type".into(), json!("http"));
+    obj.insert("url".into(), json!(format!("http://localhost:3581/mcp")));
+    let env = obj.entry("env").or_insert_with(|| json!({}));
+    env.as_object_mut()
+        .unwrap()
+        .insert("OPENROUTER_API_KEY".into(), json!(api_key));
 
     std::fs::write(&mcp_path, serde_json::to_string_pretty(&mcp).unwrap())
         .map_err(|e| format!("failed to write .mcp.json: {}", e))
@@ -305,8 +303,9 @@ mod tests {
         let content = std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(v["mcpServers"]["feldspar"].is_object());
-        assert_eq!(v["mcpServers"]["feldspar"]["args"][2], "my-proj");
-        assert!(v["mcpServers"]["feldspar"]["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"].is_null());
+        assert_eq!(v["mcpServers"]["feldspar"]["type"], "http");
+        assert_eq!(v["mcpServers"]["feldspar"]["url"], "http://localhost:3581/mcp");
+        assert_eq!(v["mcpServers"]["feldspar"]["env"]["OPENROUTER_API_KEY"], "test-key");
     }
 
     #[test]
