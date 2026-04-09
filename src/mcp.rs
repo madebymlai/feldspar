@@ -457,7 +457,7 @@ fn temper_tool_def() -> Value {
             "properties": {
                 "role": {
                     "type": "string",
-                    "enum": ["arm", "solve", "breakdown", "build", "bugfest", "ar", "pmatch"],
+                    "enum": ["orchestrator", "arm", "solve", "breakdown", "build", "bugfest", "pmatch"],
                     "description": "Agent role to activate"
                 },
                 "prefix": {
@@ -982,22 +982,29 @@ async fn handle_tools_call(state: &McpState, headers: &HeaderMap, id: Value, par
             }
             match state.agents.get(role) {
                 Some(agent) => {
-                    let prefix = match arguments.get("prefix").and_then(|p| p.as_str()) {
-                        Some(p) if !p.is_empty() => p.to_owned(),
-                        _ => loop {
-                            let candidate = agents::generate_prefix();
-                            let sessions = state.sessions.read().await;
-                            let taken = sessions.values().any(|s| s.prefix.as_deref() == Some(&candidate));
-                            drop(sessions);
-                            if !taken { break candidate; }
-                        },
+                    let is_orchestrator = role == "orchestrator";
+                    let prefix = if is_orchestrator {
+                        String::new()
+                    } else {
+                        match arguments.get("prefix").and_then(|p| p.as_str()) {
+                            Some(p) if !p.is_empty() => p.to_owned(),
+                            _ => loop {
+                                let candidate = agents::generate_prefix();
+                                let sessions = state.sessions.read().await;
+                                let taken = sessions.values().any(|s| s.prefix.as_deref() == Some(&candidate));
+                                drop(sessions);
+                                if !taken { break candidate; }
+                            },
+                        }
                     };
                     let prompt = agents::temper(agent, &state.server.config, &prefix);
 
                     if let Ok(session_id) = validate_session(state, headers).await {
                         let mut sessions = state.sessions.write().await;
                         if let Some(session) = sessions.get_mut(&session_id) {
-                            session.prefix = Some(prefix.clone());
+                            if !is_orchestrator {
+                                session.prefix = Some(prefix.clone());
+                            }
                             session.thinking_mode = Some(agent.thinking_mode.clone());
                             session.ar_gated = agent.ar_gated;
                             session.judge_cycle = 0;

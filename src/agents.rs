@@ -8,7 +8,7 @@ const AGENT_SOLVE: &str = include_str!("../agents/solve.toml");
 const AGENT_BREAKDOWN: &str = include_str!("../agents/breakdown.toml");
 const AGENT_BUILD: &str = include_str!("../agents/build.toml");
 const AGENT_BUGFEST: &str = include_str!("../agents/bugfest.toml");
-const AGENT_AR: &str = include_str!("../agents/ar.toml");
+
 const AGENT_PMATCH: &str = include_str!("../agents/pmatch.toml");
 const AGENT_ORCHESTRATOR: &str = include_str!("../agents/orchestrator.toml");
 
@@ -97,7 +97,7 @@ fn load_embedded_agents() -> HashMap<String, AgentDef> {
         AGENT_BREAKDOWN,
         AGENT_BUILD,
         AGENT_BUGFEST,
-        AGENT_AR,
+
         AGENT_PMATCH,
         AGENT_ORCHESTRATOR,
     ];
@@ -229,13 +229,13 @@ mod tests {
     #[test]
     fn test_all_agent_tomls_parse() {
         let agents = load_agents("test");
-        assert_eq!(agents.len(), 8);
+        assert_eq!(agents.len(), 7);
     }
 
     #[test]
     fn test_agent_names() {
         let agents = load_agents("test");
-        let expected = ["arm", "solve", "breakdown", "build", "bugfest", "ar", "pmatch"];
+        let expected = ["arm", "solve", "breakdown", "build", "bugfest", "pmatch", "orchestrator"];
         for name in &expected {
             assert!(agents.contains_key(*name), "missing agent: {}", name);
         }
@@ -385,7 +385,7 @@ mod tests {
     fn test_load_agents_embedded_only() {
         // Nonexistent project → only 7 embedded agents returned
         let agents = load_agents("__nonexistent_project_for_test__");
-        assert_eq!(agents.len(), 8, "expected exactly 8 embedded agents");
+        assert_eq!(agents.len(), 7, "expected exactly 7 embedded agents");
     }
 
     #[test]
