@@ -1,5 +1,5 @@
 ---
-name: config
+name: fs-config
 description: Configure feldspar principles and thinking modes. Use after feldspar init.
 ---
 
