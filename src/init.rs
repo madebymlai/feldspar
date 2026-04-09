@@ -5,6 +5,7 @@ const DEFAULT_FELDSPAR_TOML: &str = include_str!("../config/feldspar.toml");
 const DEFAULT_PRINCIPLES_TOML: &str = include_str!("../config/principles.toml");
 
 const FS_CONFIG_SKILL_MD: &str = include_str!("../skills/fs-config/SKILL.md");
+const FS_START_SKILL_MD: &str = include_str!("../skills/fs-start/SKILL.md");
 
 pub fn detect_project_name(override_name: Option<&str>) -> String {
     if let Some(name) = override_name {
@@ -214,6 +215,12 @@ fn write_skill_files(project_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("failed to create skills/fs-config dir: {}", e))?;
     std::fs::write(config_dir.join("SKILL.md"), FS_CONFIG_SKILL_MD)
         .map_err(|e| format!("failed to write fs-config SKILL.md: {}", e))?;
+
+    let start_dir = project_dir.join(".claude/skills/fs-start");
+    std::fs::create_dir_all(&start_dir)
+        .map_err(|e| format!("failed to create skills/fs-start dir: {}", e))?;
+    std::fs::write(start_dir.join("SKILL.md"), FS_START_SKILL_MD)
+        .map_err(|e| format!("failed to write fs-start SKILL.md: {}", e))?;
 
     Ok(())
 }
