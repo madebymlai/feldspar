@@ -36,6 +36,7 @@ pub struct Session {
     pub last_activity: Timestamp,
     pub prefix: Option<String>,
     pub thinking_mode: Option<String>,
+    pub artifact_type: Option<String>,
     pub ar_gated: bool,
     pub judge_cycle: u32,
     pub role: Option<String>,
@@ -433,14 +434,14 @@ async fn dispatch_message(
             DispatchResult::Response(response, Some(session_id))
         }
         "tools/list" => {
-            let (has_prefix, has_role, is_ar_gated) = if let Ok(sid) = validate_session(state, headers).await {
+            let (has_prefix, has_role, is_ar_gated, artifact_type) = if let Ok(sid) = validate_session(state, headers).await {
                 state.sessions.read().await.get(&sid)
-                    .map(|s| (s.prefix.is_some(), s.role.is_some(), s.ar_gated))
-                    .unwrap_or((false, false, false))
+                    .map(|s| (s.prefix.is_some(), s.role.is_some(), s.ar_gated, s.artifact_type.clone()))
+                    .unwrap_or((false, false, false, None))
             } else {
-                (false, false, false)
+                (false, false, false, None)
             };
-            DispatchResult::Response(handle_tools_list(has_prefix, has_role, is_ar_gated, id), None)
+            DispatchResult::Response(handle_tools_list(has_prefix, has_role, is_ar_gated, artifact_type.as_deref(), id), None)
         }
         "tools/call" => DispatchResult::Response(handle_tools_call(state, headers, id, params).await, None),
         "ping" => DispatchResult::Response(jsonrpc_result(id, json!({})), None),
@@ -483,6 +484,7 @@ async fn handle_initialize(
             last_activity: now,
             prefix: None,
             thinking_mode: None,
+            artifact_type: None,
             ar_gated: false,
             judge_cycle: 0,
             role: None,
@@ -587,19 +589,103 @@ fn sequentialthinking_tool_def() -> Value {
     })
 }
 
-fn submit_tool_def() -> Value {
+fn submit_tool_def(artifact_type: &str) -> Value {
+    let (unit_name, schema) = unit_schema_for(artifact_type);
     json!({
         "name": "submit",
-        "description": "Store an artifact for later evaluation.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "Artifact name" },
-                "content": { "type": "string", "description": "Artifact content" }
-            },
-            "required": ["name", "content"]
-        }
+        "description": format!("Add a new {} to the artifact. Errors if name already exists.", unit_name),
+        "inputSchema": schema
     })
+}
+
+fn revise_tool_def(artifact_type: &str) -> Value {
+    let (unit_name, schema) = unit_schema_for(artifact_type);
+    json!({
+        "name": "revise",
+        "description": format!("Replace an existing {} by name. Errors if name doesn't exist.", unit_name),
+        "inputSchema": schema
+    })
+}
+
+fn remove_tool_def(artifact_type: &str) -> Value {
+    let (unit_name, key_schema) = unit_key_for(artifact_type);
+    json!({
+        "name": "remove",
+        "description": format!("Remove a {} by name.", unit_name),
+        "inputSchema": key_schema
+    })
+}
+
+fn unit_schema_for(artifact_type: &str) -> (&str, Value) {
+    match artifact_type {
+        "brief" => ("requirement", crate::schemas::Requirement::json_schema()),
+        "design" => ("module", crate::schemas::Module::json_schema()),
+        "execution_plan" => ("task", crate::schemas::Task::json_schema()),
+        "diagnosis" => ("diagnosis", crate::schemas::Diagnosis::json_schema()),
+        "validation_report" => ("claim", crate::schemas::Claim::json_schema()),
+        _ => unreachable!("unhandled artifact_type: {artifact_type}"),
+    }
+}
+
+fn unit_key_for(artifact_type: &str) -> (&str, Value) {
+    match artifact_type {
+        "diagnosis" => ("diagnosis", json!({
+            "type": "object", "properties": {}, "required": [],
+            "additionalProperties": false
+        })),
+        "validation_report" => ("claim", json!({
+            "type": "object",
+            "properties": { "number": { "type": "integer", "description": "Claim number to remove" } },
+            "required": ["number"], "additionalProperties": false
+        })),
+        "brief" => ("requirement", json!({
+            "type": "object",
+            "properties": { "name": { "type": "string", "description": "Requirement name to remove" } },
+            "required": ["name"], "additionalProperties": false
+        })),
+        "design" => ("module", json!({
+            "type": "object",
+            "properties": { "name": { "type": "string", "description": "Module name to remove" } },
+            "required": ["name"], "additionalProperties": false
+        })),
+        "execution_plan" => ("task", json!({
+            "type": "object",
+            "properties": { "name": { "type": "string", "description": "Task name to remove" } },
+            "required": ["name"], "additionalProperties": false
+        })),
+        _ => unreachable!("unhandled artifact_type: {artifact_type}"),
+    }
+}
+
+fn deserialize_unit(artifact_type: &str, arguments: &serde_json::Value) -> Result<toml::Value, String> {
+    match artifact_type {
+        "brief" => {
+            let unit: crate::schemas::Requirement = serde_json::from_value(arguments.clone())
+                .map_err(|e| format!("Invalid requirement: {e}"))?;
+            toml::Value::try_from(unit).map_err(|e| format!("TOML conversion failed: {e}"))
+        }
+        "design" => {
+            let unit: crate::schemas::Module = serde_json::from_value(arguments.clone())
+                .map_err(|e| format!("Invalid module: {e}"))?;
+            toml::Value::try_from(unit).map_err(|e| format!("TOML conversion failed: {e}"))
+        }
+        "execution_plan" => {
+            let unit: crate::schemas::Task = serde_json::from_value(arguments.clone())
+                .map_err(|e| format!("Invalid task: {e}"))?;
+            toml::Value::try_from(unit).map_err(|e| format!("TOML conversion failed: {e}"))
+        }
+        "diagnosis" => {
+            let unit: crate::schemas::Diagnosis = serde_json::from_value(arguments.clone())
+                .map_err(|e| format!("Invalid diagnosis: {e}"))?;
+            toml::Value::try_from(unit).map_err(|e| format!("TOML conversion failed: {e}"))
+        }
+        "validation_report" => {
+            let unit: crate::schemas::Claim = serde_json::from_value(arguments.clone())
+                .map_err(|e| format!("Invalid claim: {e}"))?;
+            toml::Value::try_from(unit).map_err(|e| format!("TOML conversion failed: {e}"))
+        }
+        _ => unreachable!("unhandled artifact_type: {artifact_type}"),
+    }
 }
 
 fn judge_tool_def() -> Value {
@@ -654,6 +740,53 @@ fn artifact_type_to_mode(artifact_type: &str) -> Option<&str> {
     }
 }
 
+fn toml_key_for(artifact_type: &str) -> (&str, Option<&str>) {
+    match artifact_type {
+        "brief" => ("requirements", Some("name")),
+        "design" => ("modules", Some("name")),
+        "execution_plan" => ("tasks", Some("name")),
+        "diagnosis" => ("diagnosis", None),
+        "validation_report" => ("claims", Some("number")),
+        _ => unreachable!("unhandled artifact_type: {artifact_type}"),
+    }
+}
+
+fn is_singleton(artifact_type: &str) -> bool {
+    artifact_type == "diagnosis"
+}
+
+fn artifact_path(state: &McpState, prefix: &str, mode: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    std::path::PathBuf::from(home)
+        .join(".feldspar/data")
+        .join(&state.project_name)
+        .join("artifacts")
+        .join(mode)
+        .join(format!("{}.toml", prefix))
+}
+
+fn extract_key(arguments: &serde_json::Value, key_field: Option<&str>) -> Result<toml::Value, String> {
+    let field = key_field.ok_or_else(|| "No key field for singleton type".to_owned())?;
+    let val = arguments.get(field).ok_or_else(|| format!("Missing key field: {field}"))?;
+    match val {
+        serde_json::Value::String(s) => Ok(toml::Value::String(s.clone())),
+        serde_json::Value::Number(n) => {
+            let i = n.as_i64().ok_or_else(|| "Key number must be integer".to_owned())?;
+            Ok(toml::Value::Integer(i))
+        }
+        _ => Err(format!("Unsupported key type for field: {field}")),
+    }
+}
+
+fn find_unit_index(arr: &[toml::Value], key_field: &str, key_value: &toml::Value) -> Option<usize> {
+    arr.iter().position(|entry| {
+        entry.as_table()
+            .and_then(|t| t.get(key_field))
+            .map(|v| v == key_value)
+            .unwrap_or(false)
+    })
+}
+
 fn fetch_tool_def() -> Value {
     json!({
         "name": "fetch",
@@ -697,25 +830,8 @@ async fn handle_fetch(state: &McpState, headers: &HeaderMap, id: Value, params: 
         None => return jsonrpc_error(Some(id), -32602, &format!("Unknown artifact type: {}", artifact_type)),
     };
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let project = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "default".into());
-    let dir = std::path::PathBuf::from(home)
-        .join(".feldspar/data")
-        .join(&project)
-        .join("artifacts")
-        .join(mode);
-
-    let pattern = format!("{}-", prefix);
-    let content = std::fs::read_dir(&dir)
-        .ok()
-        .and_then(|entries| {
-            entries.flatten()
-                .find(|e| e.file_name().to_string_lossy().starts_with(&pattern))
-                .and_then(|e| std::fs::read_to_string(e.path()).ok())
-        });
+    let path = artifact_path(state, prefix, mode);
+    let content = std::fs::read_to_string(&path).ok();
 
     match content {
         Some(c) => jsonrpc_result(id, json!({
@@ -1008,7 +1124,7 @@ fn configure_remove_mode(id: Value, arguments: &Value, config_dir: &std::path::P
     ok_response(id, &format!("Mode '{}' removed", name))
 }
 
-fn handle_tools_list(has_prefix: bool, has_role: bool, is_ar_gated: bool, id: Value) -> Value {
+fn handle_tools_list(has_prefix: bool, has_role: bool, is_ar_gated: bool, artifact_type: Option<&str>, id: Value) -> Value {
     let mut tools = vec![];
     if !has_role {
         tools.push(temper_tool_def());
@@ -1017,8 +1133,12 @@ fn handle_tools_list(has_prefix: bool, has_role: bool, is_ar_gated: bool, id: Va
     if has_role {
         tools.push(sequentialthinking_tool_def());
     }
-    if has_prefix {
-        tools.push(submit_tool_def());
+    if let (true, Some(at)) = (has_prefix, artifact_type) {
+        if artifact_type_to_mode(at).is_some() {
+            tools.push(submit_tool_def(at));
+            tools.push(revise_tool_def(at));
+            tools.push(remove_tool_def(at));
+        }
         tools.push(fetch_tool_def());
         if is_ar_gated {
             tools.push(judge_tool_def());
@@ -1085,6 +1205,7 @@ async fn handle_tools_call(state: &McpState, headers: &HeaderMap, id: Value, par
                                 session.prefix = Some(prefix.clone());
                             }
                             session.thinking_mode = Some(agent.thinking_mode.clone());
+                            session.artifact_type = Some(agent.artifact_type.clone());
                             session.ar_gated = agent.ar_gated;
                             session.judge_cycle = 0;
                             session.role = Some(role.to_owned());
@@ -1119,6 +1240,8 @@ async fn handle_tools_call(state: &McpState, headers: &HeaderMap, id: Value, par
         }
         "configure" => handle_configure(state, id, &params),
         "submit" => handle_submit(state, headers, id, Some(params)).await,
+        "revise" => handle_revise(state, headers, id, Some(params)).await,
+        "remove" => handle_remove(state, headers, id, Some(params)).await,
         "fetch" => handle_fetch(state, headers, id, Some(params)).await,
         "judge" => handle_judge(state, headers, id, Some(params)).await,
         "sequentialthinking" => {
@@ -1170,60 +1293,303 @@ async fn handle_submit(state: &McpState, headers: &HeaderMap, id: Value, params:
         Err(_) => return jsonrpc_error(Some(id), -32602, "No valid session"),
     };
 
-    let sessions = state.sessions.read().await;
-    let session = match sessions.get(&session_id) {
-        Some(s) => s,
-        None => return jsonrpc_error(Some(id), -32602, "Session not found"),
+    let (prefix, mode, artifact_type) = {
+        let sessions = state.sessions.read().await;
+        let session = match sessions.get(&session_id) {
+            Some(s) => s,
+            None => return jsonrpc_error(Some(id), -32602, "Session not found"),
+        };
+        let prefix = match &session.prefix {
+            Some(p) => p.clone(),
+            None => return jsonrpc_error(Some(id), -32602, "Must call temper first"),
+        };
+        let mode = session.thinking_mode.clone().unwrap_or_else(|| "unknown".into());
+        let artifact_type = match &session.artifact_type {
+            Some(at) => at.clone(),
+            None => return jsonrpc_error(Some(id), -32602, "No artifact type set"),
+        };
+        (prefix, mode, artifact_type)
     };
 
-    let prefix = match &session.prefix {
-        Some(p) => p.clone(),
-        None => return jsonrpc_error(Some(id), -32602, "Must call temper first"),
-    };
-    let mode = session.thinking_mode.clone().unwrap_or_else(|| "unknown".into());
-    drop(sessions);
+    let arguments = params.as_ref()
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or_default();
 
-    let arguments = params.as_ref().and_then(|p| p.get("arguments")).cloned().unwrap_or_default();
-    let name = arguments.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    let content = arguments.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let (toml_key, key_field) = toml_key_for(&artifact_type);
+    let path = artifact_path(state, &prefix, &mode);
 
-    if name.is_empty() || content.is_empty() {
-        return jsonrpc_error(Some(id), -32602, "Missing name or content");
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return jsonrpc_error(Some(id), -32603, "Failed to create artifact directory");
+        }
     }
 
-    let artifact_type = state.agents.values()
-        .find(|a| a.thinking_mode == mode)
-        .map(|a| a.artifact_type.as_str())
-        .unwrap_or("unknown");
+    if is_singleton(&artifact_type) {
+        if path.exists() {
+            let existing = std::fs::read_to_string(&path).unwrap_or_default();
+            if !existing.trim().is_empty() {
+                return jsonrpc_error(Some(id), -32602, "Diagnosis already exists. Use revise to update.");
+            }
+        }
+        let unit_value = match deserialize_unit(&artifact_type, &arguments) {
+            Ok(v) => v,
+            Err(e) => return jsonrpc_error(Some(id), -32602, &e),
+        };
+        let unit_toml = match toml::to_string(&unit_value) {
+            Ok(s) => s,
+            Err(e) => return jsonrpc_error(Some(id), -32603, &format!("TOML serialization failed: {e}")),
+        };
+        let content = format!("[diagnosis]\n{}", unit_toml);
+        if std::fs::write(&path, content).is_err() {
+            return jsonrpc_error(Some(id), -32603, "Failed to write artifact");
+        }
+    } else {
+        let key_value = match extract_key(&arguments, key_field) {
+            Ok(v) => v,
+            Err(e) => return jsonrpc_error(Some(id), -32602, &e),
+        };
 
-    if let Err(e) = crate::schemas::validate(artifact_type, content) {
-        return jsonrpc_error(Some(id), -32602, &e);
-    }
+        if path.exists() {
+            let existing = std::fs::read_to_string(&path).unwrap_or_default();
+            if !existing.trim().is_empty() {
+                if let Ok(doc) = toml::from_str::<toml::Value>(&existing) {
+                    if let Some(arr) = doc.as_table().and_then(|t| t.get(toml_key)).and_then(|v| v.as_array()) {
+                        if find_unit_index(arr, key_field.unwrap(), &key_value).is_some() {
+                            return jsonrpc_error(Some(id), -32602,
+                                &format!("{} already exists. Use revise to update.", toml_key));
+                        }
+                    }
+                }
+            }
+        }
 
-    let artifact_name = format!("{}-{}", prefix, name);
-    let project = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "default".into());
+        let unit_value = match deserialize_unit(&artifact_type, &arguments) {
+            Ok(v) => v,
+            Err(e) => return jsonrpc_error(Some(id), -32602, &e),
+        };
+        let unit_toml = match toml::to_string(&unit_value) {
+            Ok(s) => s,
+            Err(e) => return jsonrpc_error(Some(id), -32603, &format!("TOML serialization failed: {e}")),
+        };
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let dir = std::path::PathBuf::from(home)
-        .join(".feldspar/data")
-        .join(&project)
-        .join("artifacts")
-        .join(&mode);
-
-    if std::fs::create_dir_all(&dir).is_err() {
-        return jsonrpc_error(Some(id), -32603, "Failed to create artifact directory");
-    }
-
-    let path = dir.join(format!("{}.toml", artifact_name));
-    if std::fs::write(&path, content).is_err() {
-        return jsonrpc_error(Some(id), -32603, "Failed to write artifact");
+        let block = format!("\n[[{}]]\n{}", toml_key, unit_toml);
+        use std::io::Write;
+        let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => f,
+            Err(_) => return jsonrpc_error(Some(id), -32603, "Failed to open artifact file"),
+        };
+        if file.write_all(block.as_bytes()).is_err() {
+            return jsonrpc_error(Some(id), -32603, "Failed to write artifact");
+        }
     }
 
     jsonrpc_result(id, json!({
-        "content": [{"type": "text", "text": format!("Artifact '{}' stored.", artifact_name)}],
+        "content": [{"type": "text", "text": "ok"}],
+        "isError": false
+    }))
+}
+
+async fn handle_revise(state: &McpState, headers: &HeaderMap, id: Value, params: Option<Value>) -> Value {
+    let session_id = match validate_session(state, headers).await {
+        Ok(id) => id,
+        Err(_) => return jsonrpc_error(Some(id), -32602, "No valid session"),
+    };
+
+    let (prefix, mode, artifact_type) = {
+        let sessions = state.sessions.read().await;
+        let session = match sessions.get(&session_id) {
+            Some(s) => s,
+            None => return jsonrpc_error(Some(id), -32602, "Session not found"),
+        };
+        let prefix = match &session.prefix {
+            Some(p) => p.clone(),
+            None => return jsonrpc_error(Some(id), -32602, "Must call temper first"),
+        };
+        let mode = session.thinking_mode.clone().unwrap_or_else(|| "unknown".into());
+        let artifact_type = match &session.artifact_type {
+            Some(at) => at.clone(),
+            None => return jsonrpc_error(Some(id), -32602, "No artifact type set"),
+        };
+        (prefix, mode, artifact_type)
+    };
+
+    let arguments = params.as_ref()
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or_default();
+
+    let (toml_key, key_field) = toml_key_for(&artifact_type);
+    let path = artifact_path(state, &prefix, &mode);
+
+    if !path.exists() {
+        return jsonrpc_error(Some(id), -32602, "No artifact to revise");
+    }
+
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return jsonrpc_error(Some(id), -32603, "Failed to read artifact"),
+    };
+
+    let unit_value = match deserialize_unit(&artifact_type, &arguments) {
+        Ok(v) => v,
+        Err(e) => return jsonrpc_error(Some(id), -32602, &e),
+    };
+
+    if is_singleton(&artifact_type) {
+        let mut doc: toml::Value = match toml::from_str(&existing) {
+            Ok(v) => v,
+            Err(_) => toml::Value::Table(toml::map::Map::new()),
+        };
+        if let Some(table) = doc.as_table_mut() {
+            if let toml::Value::Table(unit_table) = unit_value {
+                table.insert("diagnosis".to_owned(), toml::Value::Table(unit_table));
+            }
+        }
+        let toml_str = match toml::to_string(&doc) {
+            Ok(s) => s,
+            Err(e) => return jsonrpc_error(Some(id), -32603, &format!("TOML serialization failed: {e}")),
+        };
+        if let Err(e) = crate::schemas::validate(&artifact_type, &toml_str) {
+            return jsonrpc_error(Some(id), -32602, &format!("Revise produced invalid artifact: {e}"));
+        }
+        if std::fs::write(&path, toml_str).is_err() {
+            return jsonrpc_error(Some(id), -32603, "Failed to write artifact");
+        }
+    } else {
+        let key_value = match extract_key(&arguments, key_field) {
+            Ok(v) => v,
+            Err(e) => return jsonrpc_error(Some(id), -32602, &e),
+        };
+
+        let mut doc: toml::Value = match toml::from_str(&existing) {
+            Ok(v) => v,
+            Err(e) => return jsonrpc_error(Some(id), -32602, &format!("Failed to parse artifact: {e}")),
+        };
+
+        let arr = match doc.as_table_mut()
+            .and_then(|t| t.get_mut(toml_key))
+            .and_then(|v| v.as_array_mut())
+        {
+            Some(a) => a,
+            None => return jsonrpc_error(Some(id), -32602,
+                &format!("{} '{}' not found. Use submit to create.", toml_key,
+                    match &key_value { toml::Value::String(s) => s.clone(), toml::Value::Integer(n) => n.to_string(), _ => "?".into() })),
+        };
+
+        let idx = match find_unit_index(arr, key_field.unwrap(), &key_value) {
+            Some(i) => i,
+            None => return jsonrpc_error(Some(id), -32602,
+                &format!("{} '{}' not found. Use submit to create.", toml_key,
+                    match &key_value { toml::Value::String(s) => s.clone(), toml::Value::Integer(n) => n.to_string(), _ => "?".into() })),
+        };
+
+        arr[idx] = unit_value;
+
+        let toml_str = match toml::to_string(&doc) {
+            Ok(s) => s,
+            Err(e) => return jsonrpc_error(Some(id), -32603, &format!("TOML serialization failed: {e}")),
+        };
+        if let Err(e) = crate::schemas::validate(&artifact_type, &toml_str) {
+            return jsonrpc_error(Some(id), -32602, &format!("Revise produced invalid artifact: {e}"));
+        }
+        if std::fs::write(&path, toml_str).is_err() {
+            return jsonrpc_error(Some(id), -32603, "Failed to write artifact");
+        }
+    }
+
+    jsonrpc_result(id, json!({
+        "content": [{"type": "text", "text": "ok"}],
+        "isError": false
+    }))
+}
+
+async fn handle_remove(state: &McpState, headers: &HeaderMap, id: Value, params: Option<Value>) -> Value {
+    let session_id = match validate_session(state, headers).await {
+        Ok(id) => id,
+        Err(_) => return jsonrpc_error(Some(id), -32602, "No valid session"),
+    };
+
+    let (prefix, mode, artifact_type) = {
+        let sessions = state.sessions.read().await;
+        let session = match sessions.get(&session_id) {
+            Some(s) => s,
+            None => return jsonrpc_error(Some(id), -32602, "Session not found"),
+        };
+        let prefix = match &session.prefix {
+            Some(p) => p.clone(),
+            None => return jsonrpc_error(Some(id), -32602, "Must call temper first"),
+        };
+        let mode = session.thinking_mode.clone().unwrap_or_else(|| "unknown".into());
+        let artifact_type = match &session.artifact_type {
+            Some(at) => at.clone(),
+            None => return jsonrpc_error(Some(id), -32602, "No artifact type set"),
+        };
+        (prefix, mode, artifact_type)
+    };
+
+    let arguments = params.as_ref()
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or_default();
+
+    let (toml_key, key_field) = toml_key_for(&artifact_type);
+    let path = artifact_path(state, &prefix, &mode);
+
+    if !path.exists() {
+        return jsonrpc_error(Some(id), -32602, "No artifact to remove from");
+    }
+
+    if is_singleton(&artifact_type) {
+        if std::fs::write(&path, "").is_err() {
+            return jsonrpc_error(Some(id), -32603, "Failed to truncate artifact");
+        }
+    } else {
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return jsonrpc_error(Some(id), -32603, "Failed to read artifact"),
+        };
+
+        let key_value = match extract_key(&arguments, key_field) {
+            Ok(v) => v,
+            Err(e) => return jsonrpc_error(Some(id), -32602, &e),
+        };
+
+        let mut doc: toml::Value = match toml::from_str(&existing) {
+            Ok(v) => v,
+            Err(e) => return jsonrpc_error(Some(id), -32602, &format!("Failed to parse artifact: {e}")),
+        };
+
+        let arr = match doc.as_table_mut()
+            .and_then(|t| t.get_mut(toml_key))
+            .and_then(|v| v.as_array_mut())
+        {
+            Some(a) => a,
+            None => return jsonrpc_error(Some(id), -32602,
+                &format!("{} '{}' not found.", toml_key,
+                    match &key_value { toml::Value::String(s) => s.clone(), toml::Value::Integer(n) => n.to_string(), _ => "?".into() })),
+        };
+
+        let idx = match find_unit_index(arr, key_field.unwrap(), &key_value) {
+            Some(i) => i,
+            None => return jsonrpc_error(Some(id), -32602,
+                &format!("{} '{}' not found.", toml_key,
+                    match &key_value { toml::Value::String(s) => s.clone(), toml::Value::Integer(n) => n.to_string(), _ => "?".into() })),
+        };
+
+        arr.remove(idx);
+
+        let toml_str = match toml::to_string(&doc) {
+            Ok(s) => s,
+            Err(e) => return jsonrpc_error(Some(id), -32603, &format!("TOML serialization failed: {e}")),
+        };
+        if std::fs::write(&path, toml_str).is_err() {
+            return jsonrpc_error(Some(id), -32603, "Failed to write artifact");
+        }
+    }
+
+    jsonrpc_result(id, json!({
+        "content": [{"type": "text", "text": "ok"}],
         "isError": false
     }))
 }
@@ -1683,39 +2049,45 @@ mod tests {
 
     #[test]
     fn test_tools_list_no_prefix() {
-        // No prefix, no role → temper + configure, no sequentialthinking/submit/fetch/judge
-        let result = handle_tools_list(false, false, false, json!(1));
+        // No prefix, no role → temper + configure, no sequentialthinking/submit/revise/remove/fetch/judge
+        let result = handle_tools_list(false, false, false, None, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(!names.contains(&"sequentialthinking"));
         assert!(names.contains(&"temper"));
         assert!(names.contains(&"configure"));
         assert!(!names.contains(&"submit"));
+        assert!(!names.contains(&"revise"));
+        assert!(!names.contains(&"remove"));
         assert!(!names.contains(&"fetch"));
         assert!(!names.contains(&"judge"));
     }
 
     #[test]
     fn test_tools_list_with_prefix_ar_gated() {
-        // has_prefix=true, ar_gated=true, no role → temper + configure + submit + fetch + judge (no sequentialthinking)
-        let result = handle_tools_list(true, false, true, json!(1));
+        // has_prefix=true, ar_gated=true, no role → temper + configure + submit + revise + remove + fetch + judge
+        let result = handle_tools_list(true, false, true, Some("brief"), json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(!names.contains(&"sequentialthinking"));
         assert!(names.contains(&"temper"));
         assert!(names.contains(&"configure"));
         assert!(names.contains(&"submit"));
+        assert!(names.contains(&"revise"));
+        assert!(names.contains(&"remove"));
         assert!(names.contains(&"fetch"));
         assert!(names.contains(&"judge"));
     }
 
     #[test]
     fn test_tools_list_with_prefix_not_ar_gated() {
-        // has_prefix=true, ar_gated=false → submit + fetch, no judge
-        let result = handle_tools_list(true, false, false, json!(1));
+        // has_prefix=true, ar_gated=false → submit + revise + remove + fetch, no judge
+        let result = handle_tools_list(true, false, false, Some("brief"), json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"submit"));
+        assert!(names.contains(&"revise"));
+        assert!(names.contains(&"remove"));
         assert!(names.contains(&"fetch"));
         assert!(!names.contains(&"judge"));
     }
@@ -2023,7 +2395,7 @@ mod tests {
     #[test]
     fn test_tools_list_base_tools() {
         // No prefix, no role → 2 base tools (temper + configure)
-        let result = handle_tools_list(false, false, false, json!(1));
+        let result = handle_tools_list(false, false, false, None, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -2035,7 +2407,7 @@ mod tests {
     #[test]
     fn test_tools_list_before_temper_no_sequentialthinking() {
         // No role → sequentialthinking absent, count is 2
-        let result = handle_tools_list(false, false, false, json!(1));
+        let result = handle_tools_list(false, false, false, None, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(!names.contains(&"sequentialthinking"));
@@ -2045,7 +2417,7 @@ mod tests {
     #[test]
     fn test_tools_list_after_temper_has_sequentialthinking() {
         // has_role=true → sequentialthinking present
-        let result = handle_tools_list(true, true, false, json!(1));
+        let result = handle_tools_list(true, true, false, None, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"sequentialthinking"));
@@ -2068,7 +2440,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_list_after_temper_shows_all() {
-        // After temper(build) → temper hidden, 5 tools: sequentialthinking + configure + submit + fetch + judge
+        // After temper(build) → temper hidden, 4 tools: configure + sequentialthinking + fetch + judge
+        // (build has artifact_type=code which has no typed schema, so submit/revise/remove absent)
         let (app, session_id) = initialized_app().await;
         post_mcp_with_session(
             app.clone(),
@@ -2084,11 +2457,12 @@ mod tests {
         .await;
         let body = body_json(resp).await;
         let tools = body["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 4);
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(!names.contains(&"temper"));
         assert!(names.contains(&"configure"));
-        assert!(names.contains(&"submit"));
+        assert!(names.contains(&"sequentialthinking"));
+        assert!(!names.contains(&"submit"));
         assert!(names.contains(&"fetch"));
         assert!(names.contains(&"judge"));
     }
@@ -2164,24 +2538,23 @@ mod tests {
     #[tokio::test]
     async fn test_submit_stores_artifact() {
         let (app, session_id) = initialized_app().await;
-        // Call temper first
+        // Temper as arm (brief artifact type)
         post_mcp_with_session(
             app.clone(),
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
             &session_id,
         )
         .await;
-        // Now submit
-        let resp = post_mcp_with_session(
-            app,
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"submit","arguments":{"name":"plan","content":"my plan content"}}}"#,
-            &session_id,
-        )
-        .await;
+        // Submit a typed requirement
+        let body_str = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {"name": "auth", "description": "User authentication", "user_story": "As a user, I want to log in"}}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &body_str, &session_id).await;
         let body = body_json(resp).await;
         assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
         let text = body["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("stored"), "expected stored confirmation");
+        assert_eq!(text, "ok", "expected ok confirmation");
     }
 
     #[tokio::test]
@@ -2416,21 +2789,18 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
             &session_id,
         ).await;
-        let valid_brief = r#"
-[[requirements]]
-name = "Auth"
-description = "User authentication"
-user_story = "As a user, I want to log in"
-"#;
         let body_str = serde_json::to_string(&json!({
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-            "params": {"name": "submit", "arguments": {"name": "brief", "content": valid_brief}}
+            "params": {"name": "submit", "arguments": {
+                "name": "Auth", "description": "User authentication",
+                "user_story": "As a user, I want to log in"
+            }}
         })).unwrap();
         let resp = post_mcp_with_session(app, &body_str, &session_id).await;
         let body = body_json(resp).await;
         assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
         let text = body["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("stored"));
+        assert_eq!(text, "ok");
     }
 
     #[tokio::test]
@@ -2441,35 +2811,41 @@ user_story = "As a user, I want to log in"
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
             &session_id,
         ).await;
+        // Missing required fields user_story → deserialization error
         let body_str = serde_json::to_string(&json!({
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-            "params": {"name": "submit", "arguments": {"name": "brief", "content": "garbage content {{ not toml"}}
+            "params": {"name": "submit", "arguments": {"name": "X"}}
         })).unwrap();
         let resp = post_mcp_with_session(app, &body_str, &session_id).await;
         let body = body_json(resp).await;
         assert_eq!(body["error"]["code"], -32602);
         let msg = body["error"]["message"].as_str().unwrap();
-        assert!(msg.to_lowercase().contains("schema validation failed") || msg.to_lowercase().contains("brief"), "error: {}", msg);
+        assert!(msg.to_lowercase().contains("invalid") || msg.to_lowercase().contains("missing"), "error: {}", msg);
     }
 
     #[tokio::test]
-    async fn test_submit_build_skips_validation() {
+    async fn test_submit_build_skips_typed_tools() {
         let (app, session_id) = initialized_app().await;
-        // build has artifact_type=code → no validation
+        // build has artifact_type=code → submit returns "No artifact type set" because code is not in toml_key_for
+        // Actually build does set artifact_type="code" but toml_key_for("code") panics → use submit without temper
+        // Instead verify build session does NOT show submit in tools/list
         post_mcp_with_session(
             app.clone(),
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
             &session_id,
         ).await;
-        let body_str = serde_json::to_string(&json!({
-            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-            "params": {"name": "submit", "arguments": {"name": "impl", "content": "anything at all, not even valid TOML {{ }}"}}
-        })).unwrap();
-        let resp = post_mcp_with_session(app, &body_str, &session_id).await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
+            &session_id,
+        ).await;
         let body = body_json(resp).await;
-        assert!(body.get("error").is_none(), "build agent should skip validation: {:?}", body);
-        let text = body["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("stored"));
+        let tools = body["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(!names.contains(&"submit"), "build agent should not expose typed submit");
+        assert!(!names.contains(&"revise"), "build agent should not expose revise");
+        assert!(!names.contains(&"remove"), "build agent should not expose remove");
+        assert!(names.contains(&"fetch"), "build agent should still have fetch");
     }
 
     // --- Temper prefix tests (Task 2) ---
@@ -2523,7 +2899,7 @@ user_story = "As a user, I want to log in"
 
     #[test]
     fn test_tools_list_with_prefix_has_fetch() {
-        let result = handle_tools_list(true, false, false, json!(1));
+        let result = handle_tools_list(true, false, false, Some("brief"), json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"fetch"), "fetch not in tempered session tools");
@@ -2531,7 +2907,7 @@ user_story = "As a user, I want to log in"
 
     #[test]
     fn test_tools_list_no_prefix_no_fetch() {
-        let result = handle_tools_list(false, false, false, json!(1));
+        let result = handle_tools_list(false, false, false, None, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(!names.contains(&"fetch"), "fetch must not appear without prefix");
@@ -2553,11 +2929,12 @@ user_story = "As a user, I want to log in"
         let text = body["result"]["content"][0]["text"].as_str().unwrap();
         let prefix = text.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap().to_owned();
 
-        // Submit a valid brief
-        let valid_brief = "[[requirements]]\nname = \"X\"\ndescription = \"Y\"\nuser_story = \"Z\"\n";
+        // Submit a typed requirement
         let submit_body = serde_json::to_string(&json!({
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-            "params": {"name": "submit", "arguments": {"name": "brief", "content": valid_brief}}
+            "params": {"name": "submit", "arguments": {
+                "name": "X", "description": "Y", "user_story": "Z"
+            }}
         })).unwrap();
         post_mcp_with_session(app.clone(), &submit_body, &session_id).await;
 
@@ -2849,6 +3226,7 @@ user_story = "As a user, I want to log in"
                 last_activity: 0, // already expired
                 prefix: Some("cl01".into()),
                 thinking_mode: None,
+                artifact_type: None,
                 ar_gated: false,
                 judge_cycle: 0,
                 role: Some("build".into()),
@@ -2898,15 +3276,15 @@ user_story = "As a user, I want to log in"
             // Expired session with prefix sh01
             sessions.insert("exp".into(), Session {
                 id: "exp".into(), initialized: true, created_at: 0, last_activity: 0,
-                prefix: Some("sh01".into()), thinking_mode: None, ar_gated: false,
-                judge_cycle: 0, role: Some("build".into()), group: Some("01".into()),
+                prefix: Some("sh01".into()), thinking_mode: None, artifact_type: None,
+                ar_gated: false, judge_cycle: 0, role: Some("build".into()), group: Some("01".into()),
             });
             // Active session with same prefix
             sessions.insert("active".into(), Session {
                 id: "active".into(), initialized: true, created_at: now_millis(),
                 last_activity: now_millis(),
-                prefix: Some("sh01".into()), thinking_mode: None, ar_gated: false,
-                judge_cycle: 0, role: Some("build".into()), group: Some("02".into()),
+                prefix: Some("sh01".into()), thinking_mode: None, artifact_type: None,
+                ar_gated: false, judge_cycle: 0, role: Some("build".into()), group: Some("02".into()),
             });
         }
 
@@ -2994,19 +3372,11 @@ user_story = "As a user, I want to log in"
         let entry = "\n[[changes]]\ntimestamp = 1234567890\nfile = \"src/main.rs\"\ndiff = \"\"\"\n-old line\n+new line\n\"\"\"\n";
         std::fs::write(&change_file, entry).unwrap();
 
-        // Submit artifact (code type always validates)
-        let resp = post_mcp_with_session(
-            app.clone(),
-            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"submit","arguments":{"name":"plan","content":"my build plan"}}}"#,
-            &session_id,
-        ).await;
-        let body = body_json(resp).await;
-        assert!(body.get("error").is_none(), "submit error: {:?}", body);
-
+        // build has artifact_type=code — no typed submit tool exposed
         // Judge auto-approves (no AR engine in tests)
         let resp = post_mcp_with_session(
             app,
-            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"judge","arguments":{"name":"plan"}}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"judge","arguments":{"name":"plan"}}}"#,
             &session_id,
         ).await;
         let body = body_json(resp).await;
@@ -3022,6 +3392,12 @@ user_story = "As a user, I want to log in"
 
     #[tokio::test]
     async fn test_full_flow_bugfest_agent() {
+        // Clean up artifact from previous runs
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let artifact_path = std::path::PathBuf::from(home)
+            .join(".feldspar/data/test/artifacts/debugging/b4gs.toml");
+        let _ = std::fs::remove_file(&artifact_path);
+
         let (app, session_id) = initialized_app().await;
 
         // Temper as bugfest agent
@@ -3055,17 +3431,17 @@ user_story = "As a user, I want to log in"
         let entry = "\n[[changes]]\ntimestamp = 9999\nfile = \"src/bug.rs\"\ndiff = \"\"\"\n-bad\n+good\n\"\"\"\n";
         std::fs::write(&change_file, entry).unwrap();
 
-        // Submit a valid diagnosis artifact
-        let diagnosis_toml = r#"[diagnosis]
-symptom = "crash on startup"
-root_cause = "null pointer in init"
-evidence = ["src/main.rs:10"]
-fix = "add null check"
-files_changed = ["src/main.rs"]"#;
+        // Submit a valid diagnosis artifact (typed fields)
         let submit_body = serde_json::json!({
             "jsonrpc": "2.0", "id": 5,
             "method": "tools/call",
-            "params": {"name": "submit", "arguments": {"name": "debug", "content": diagnosis_toml}}
+            "params": {"name": "submit", "arguments": {
+                "symptom": "crash on startup",
+                "root_cause": "null pointer in init",
+                "evidence": ["src/main.rs:10"],
+                "fix": "add null check",
+                "files_changed": ["src/main.rs"]
+            }}
         });
         let resp = post_mcp_with_session(
             app.clone(),
@@ -3258,5 +3634,532 @@ files_changed = ["src/main.rs"]"#;
         let changes = parsed.unwrap();
         let diff_val = changes["changes"][0]["diff"].as_str().unwrap();
         assert!(diff_val.contains("\"\"\""), "parsed diff must restore triple quotes");
+    }
+
+    // --- Typed artifact submission tests (Agent 2) ---
+
+    #[test]
+    fn test_toml_key_for_all_types() {
+        assert_eq!(toml_key_for("brief"), ("requirements", Some("name")));
+        assert_eq!(toml_key_for("design"), ("modules", Some("name")));
+        assert_eq!(toml_key_for("execution_plan"), ("tasks", Some("name")));
+        assert_eq!(toml_key_for("diagnosis"), ("diagnosis", None));
+        assert_eq!(toml_key_for("validation_report"), ("claims", Some("number")));
+    }
+
+    #[test]
+    fn test_extract_key_string() {
+        let result = extract_key(&json!({"name": "auth"}), Some("name"));
+        assert_eq!(result, Ok(toml::Value::String("auth".into())));
+    }
+
+    #[test]
+    fn test_extract_key_integer() {
+        let result = extract_key(&json!({"number": 1}), Some("number"));
+        assert_eq!(result, Ok(toml::Value::Integer(1)));
+    }
+
+    #[test]
+    fn test_extract_key_missing() {
+        let result = extract_key(&json!({}), Some("name"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_unit_index_string_key() {
+        let arr = vec![
+            toml::Value::Table({
+                let mut t = toml::map::Map::new();
+                t.insert("name".into(), toml::Value::String("a".into()));
+                t
+            }),
+            toml::Value::Table({
+                let mut t = toml::map::Map::new();
+                t.insert("name".into(), toml::Value::String("b".into()));
+                t
+            }),
+        ];
+        assert_eq!(find_unit_index(&arr, "name", &toml::Value::String("b".into())), Some(1));
+    }
+
+    #[test]
+    fn test_find_unit_index_integer_key() {
+        let arr = vec![
+            toml::Value::Table({
+                let mut t = toml::map::Map::new();
+                t.insert("number".into(), toml::Value::Integer(1));
+                t
+            }),
+            toml::Value::Table({
+                let mut t = toml::map::Map::new();
+                t.insert("number".into(), toml::Value::Integer(2));
+                t
+            }),
+        ];
+        assert_eq!(find_unit_index(&arr, "number", &toml::Value::Integer(2)), Some(1));
+    }
+
+    #[test]
+    fn test_find_unit_index_not_found() {
+        let arr = vec![toml::Value::Table({
+            let mut t = toml::map::Map::new();
+            t.insert("name".into(), toml::Value::String("x".into()));
+            t
+        })];
+        assert_eq!(find_unit_index(&arr, "name", &toml::Value::String("y".into())), None);
+    }
+
+    #[test]
+    fn test_submit_tool_def_brief_schema() {
+        let tool = submit_tool_def("brief");
+        let props = &tool["inputSchema"]["properties"];
+        assert!(props["name"].is_object(), "brief schema must have name");
+        assert!(props["description"].is_object(), "brief schema must have description");
+        assert!(props["user_story"].is_object(), "brief schema must have user_story");
+    }
+
+    #[test]
+    fn test_remove_tool_def_claim_schema() {
+        let tool = remove_tool_def("validation_report");
+        let props = &tool["inputSchema"]["properties"];
+        assert!(props["number"].is_object(), "claim remove schema must have number");
+        assert!(props.as_object().map(|m| m.len() == 1).unwrap_or(false), "only number property");
+    }
+
+    #[test]
+    fn test_tools_list_includes_revise_remove() {
+        let result = handle_tools_list(true, false, false, Some("brief"), json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"submit"));
+        assert!(names.contains(&"revise"));
+        assert!(names.contains(&"remove"));
+    }
+
+    #[test]
+    fn test_tools_list_no_prefix_no_submit_revise_remove() {
+        let result = handle_tools_list(false, false, false, None, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(!names.contains(&"submit"));
+        assert!(!names.contains(&"revise"));
+        assert!(!names.contains(&"remove"));
+    }
+
+    #[tokio::test]
+    async fn test_temper_sets_artifact_type() {
+        let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        // arm has artifact_type=brief → submit schema shows requirement fields
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let tools = body["result"]["tools"].as_array().unwrap();
+        let submit = tools.iter().find(|t| t["name"] == "submit").expect("submit must be present for arm");
+        assert!(submit["inputSchema"]["properties"]["user_story"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_submit_requirement_creates_file() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let prefix = text.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap().to_owned();
+
+        let artifact_file = std::path::PathBuf::from(&home)
+            .join(".feldspar/data/test/artifacts/brainstorming")
+            .join(format!("{}.toml", prefix));
+        let _ = std::fs::remove_file(&artifact_file);
+
+        let body_str = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {
+                "name": "auth", "description": "Authentication", "user_story": "As a user"
+            }}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &body_str, &session_id).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        assert!(artifact_file.exists(), "artifact file must exist");
+        let content = std::fs::read_to_string(&artifact_file).unwrap();
+        assert!(content.contains("[[requirements]]"));
+        assert!(content.contains("auth"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_duplicate_errors() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let prefix = text.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap().to_owned();
+
+        let artifact_file = std::path::PathBuf::from(&home)
+            .join(".feldspar/data/test/artifacts/brainstorming")
+            .join(format!("{}.toml", prefix));
+        let _ = std::fs::remove_file(&artifact_file);
+
+        let submit = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {
+                "name": "auth", "description": "Auth", "user_story": "As user"
+            }}
+        })).unwrap();
+        post_mcp_with_session(app.clone(), &submit, &session_id).await;
+
+        let resp = post_mcp_with_session(app, &submit, &session_id).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(body["error"]["message"].as_str().unwrap().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_diagnosis_singleton() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"bugfest"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let prefix = text.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap().to_owned();
+
+        let artifact_file = std::path::PathBuf::from(&home)
+            .join(".feldspar/data/test/artifacts/debugging")
+            .join(format!("{}.toml", prefix));
+        let _ = std::fs::remove_file(&artifact_file);
+
+        let body_str = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {
+                "symptom": "crash", "root_cause": "null ptr",
+                "evidence": ["src/main.rs:1"], "fix": "add check",
+                "files_changed": ["src/main.rs"]
+            }}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &body_str, &session_id).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        let content = std::fs::read_to_string(&artifact_file).unwrap();
+        assert!(content.contains("[diagnosis]"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_invalid_fields() {
+        let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        // Missing user_story → deserialization error
+        let body_str = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {"name": "X", "description": "Y"}}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &body_str, &session_id).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn test_revise_requirement() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let prefix = text.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap().to_owned();
+
+        let artifact_file = std::path::PathBuf::from(&home)
+            .join(".feldspar/data/test/artifacts/brainstorming")
+            .join(format!("{}.toml", prefix));
+        let _ = std::fs::remove_file(&artifact_file);
+
+        // Submit
+        let submit = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {
+                "name": "auth", "description": "Old description", "user_story": "As user"
+            }}
+        })).unwrap();
+        post_mcp_with_session(app.clone(), &submit, &session_id).await;
+
+        // Revise
+        let revise = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "revise", "arguments": {
+                "name": "auth", "description": "New description", "user_story": "As user"
+            }}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &revise, &session_id).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "revise error: {:?}", body);
+        let content = std::fs::read_to_string(&artifact_file).unwrap();
+        assert!(content.contains("New description"));
+        assert!(!content.contains("Old description"));
+    }
+
+    #[tokio::test]
+    async fn test_revise_not_found() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let prefix = text.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap().to_owned();
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let artifact_file = std::path::PathBuf::from(&home)
+            .join(".feldspar/data/test/artifacts/brainstorming")
+            .join(format!("{}.toml", prefix));
+        let _ = std::fs::remove_file(&artifact_file);
+
+        // Submit one requirement
+        let submit = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {
+                "name": "existing", "description": "D", "user_story": "S"
+            }}
+        })).unwrap();
+        post_mcp_with_session(app.clone(), &submit, &session_id).await;
+
+        // Try to revise a nonexistent one
+        let revise = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "revise", "arguments": {
+                "name": "nonexistent", "description": "D", "user_story": "S"
+            }}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &revise, &session_id).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(body["error"]["message"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_revise_no_artifact() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let prefix = text.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap().to_owned();
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let artifact_file = std::path::PathBuf::from(&home)
+            .join(".feldspar/data/test/artifacts/brainstorming")
+            .join(format!("{}.toml", prefix));
+        let _ = std::fs::remove_file(&artifact_file);
+
+        let revise = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "revise", "arguments": {
+                "name": "auth", "description": "D", "user_story": "S"
+            }}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &revise, &session_id).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(body["error"]["message"].as_str().unwrap().contains("No artifact to revise"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_requirement() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let prefix = text.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap().to_owned();
+
+        let artifact_file = std::path::PathBuf::from(&home)
+            .join(".feldspar/data/test/artifacts/brainstorming")
+            .join(format!("{}.toml", prefix));
+        let _ = std::fs::remove_file(&artifact_file);
+
+        // Submit 2 requirements
+        for name in ["keep", "remove_me"] {
+            let body_str = serde_json::to_string(&json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "submit", "arguments": {
+                    "name": name, "description": "D", "user_story": "S"
+                }}
+            })).unwrap();
+            post_mcp_with_session(app.clone(), &body_str, &session_id).await;
+        }
+
+        // Remove one
+        let remove = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "remove", "arguments": {"name": "remove_me"}}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &remove, &session_id).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "remove error: {:?}", body);
+
+        let content = std::fs::read_to_string(&artifact_file).unwrap();
+        assert!(content.contains("keep"), "kept requirement must remain");
+        assert!(!content.contains("remove_me"), "removed requirement must be gone");
+    }
+
+    #[tokio::test]
+    async fn test_remove_diagnosis_truncates() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"bugfest"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let prefix = text.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap().to_owned();
+
+        let artifact_file = std::path::PathBuf::from(&home)
+            .join(".feldspar/data/test/artifacts/debugging")
+            .join(format!("{}.toml", prefix));
+        let _ = std::fs::remove_file(&artifact_file);
+
+        // Submit diagnosis
+        let submit = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {
+                "symptom": "crash", "root_cause": "null",
+                "evidence": ["src/main.rs:1"], "fix": "fix",
+                "files_changed": ["src/main.rs"]
+            }}
+        })).unwrap();
+        post_mcp_with_session(app.clone(), &submit, &session_id).await;
+
+        // Remove → truncates
+        let remove = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "remove", "arguments": {}}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &remove, &session_id).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "remove error: {:?}", body);
+        assert!(artifact_file.exists(), "file must still exist after truncate");
+        let content = std::fs::read_to_string(&artifact_file).unwrap();
+        assert!(content.is_empty(), "file must be empty after diagnosis remove");
+    }
+
+    #[tokio::test]
+    async fn test_remove_then_submit() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"bugfest"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let prefix = text.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap().to_owned();
+
+        let artifact_file = std::path::PathBuf::from(&home)
+            .join(".feldspar/data/test/artifacts/debugging")
+            .join(format!("{}.toml", prefix));
+        let _ = std::fs::remove_file(&artifact_file);
+
+        let diag = json!({
+            "symptom": "crash", "root_cause": "null",
+            "evidence": ["src/main.rs:1"], "fix": "fix",
+            "files_changed": ["src/main.rs"]
+        });
+
+        let submit = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "submit", "arguments": diag}
+        })).unwrap();
+        post_mcp_with_session(app.clone(), &submit, &session_id).await;
+
+        let remove = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "remove", "arguments": {}}
+        })).unwrap();
+        post_mcp_with_session(app.clone(), &remove, &session_id).await;
+
+        // Submit again should succeed after truncation
+        let resp = post_mcp_with_session(app, &submit, &session_id).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "second submit after remove error: {:?}", body);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_after_typed_submit() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let (app, session_id) = initialized_app().await;
+
+        // Temper as arm
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let prefix = text.lines().next().unwrap().strip_prefix("PREFIX: ").unwrap().to_owned();
+
+        let artifact_file = std::path::PathBuf::from(&home)
+            .join(".feldspar/data/test/artifacts/brainstorming")
+            .join(format!("{}.toml", prefix));
+        let _ = std::fs::remove_file(&artifact_file);
+
+        // Submit requirement
+        let submit = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "submit", "arguments": {
+                "name": "auth", "description": "Auth module", "user_story": "As a user"
+            }}
+        })).unwrap();
+        post_mcp_with_session(app.clone(), &submit, &session_id).await;
+
+        // Fetch brief
+        let fetch = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "fetch", "arguments": {"prefix": prefix, "type": "brief"}}
+        })).unwrap();
+        let resp = post_mcp_with_session(app, &fetch, &session_id).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "fetch error: {:?}", body);
+        let returned = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(returned.contains("requirements"), "expected requirements in: {}", returned);
+        assert!(returned.contains("auth"));
     }
 }

@@ -1,23 +1,24 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BriefArtifact {
     pub requirements: Vec<Requirement>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Requirement {
     pub name: String,
     pub description: String,
     pub user_story: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct DesignArtifact {
     pub modules: Vec<Module>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Module {
     pub name: String,
     pub purpose: String,
@@ -25,35 +26,27 @@ pub struct Module {
     pub description: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ExecutionPlanArtifact {
-    pub groups: Vec<Group>,
     pub tasks: Vec<Task>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Group {
-    pub tasks: Vec<u32>,
-    pub depends_on: Vec<u32>,
-    pub description: String,
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Task {
     pub number: u32,
     pub name: String,
+    pub group: String,
+    pub depends_on: Vec<u32>,
     pub leverages: Vec<String>,
     pub description: String,
-    #[serde(default)]
-    pub pseudocode: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct DiagnosisArtifact {
     pub diagnosis: Diagnosis,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Diagnosis {
     pub symptom: String,
     pub root_cause: String,
@@ -62,14 +55,12 @@ pub struct Diagnosis {
     pub files_changed: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ValidationReportArtifact {
     pub claims: Vec<Claim>,
-    #[serde(default)]
-    pub extras: Vec<Extra>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Claim {
     pub number: u32,
     pub text: String,
@@ -77,10 +68,86 @@ pub struct Claim {
     pub location: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Extra {
-    pub description: String,
-    pub location: String,
+impl Requirement {
+    pub fn json_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Requirement identifier" },
+                "description": { "type": "string", "description": "What is required" },
+                "user_story": { "type": "string", "description": "As a [user], I want [goal] so that [reason]" }
+            },
+            "required": ["name", "description", "user_story"],
+            "additionalProperties": false
+        })
+    }
+}
+
+impl Module {
+    pub fn json_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Module name" },
+                "purpose": { "type": "string", "description": "What this module is responsible for" },
+                "leverages": { "type": "array", "items": { "type": "string" }, "description": "Technologies/patterns used" },
+                "description": { "type": "string", "description": "Detailed module description" }
+            },
+            "required": ["name", "purpose", "leverages", "description"],
+            "additionalProperties": false
+        })
+    }
+}
+
+impl Task {
+    pub fn json_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "number": { "type": "integer", "description": "Task number" },
+                "name": { "type": "string", "description": "Task name" },
+                "group": { "type": "string", "pattern": "^[0-9]{2}$", "description": "Group identifier (NN format, e.g. 01, 02)" },
+                "depends_on": { "type": "array", "items": { "type": "integer" }, "description": "Task numbers this depends on" },
+                "leverages": { "type": "array", "items": { "type": "string" }, "description": "Technologies/patterns used" },
+                "description": { "type": "string", "description": "What this task accomplishes" }
+            },
+            "required": ["number", "name", "group", "depends_on", "leverages", "description"],
+            "additionalProperties": false
+        })
+    }
+}
+
+impl Diagnosis {
+    pub fn json_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "symptom": { "type": "string", "description": "Observable problem" },
+                "root_cause": { "type": "string", "description": "Underlying cause" },
+                "evidence": { "type": "array", "items": { "type": "string" }, "description": "Supporting evidence (file paths, logs)" },
+                "fix": { "type": "string", "description": "How to fix the problem" },
+                "files_changed": { "type": "array", "items": { "type": "string" }, "description": "Files that need to change" }
+            },
+            "required": ["symptom", "root_cause", "evidence", "fix", "files_changed"],
+            "additionalProperties": false
+        })
+    }
+}
+
+impl Claim {
+    pub fn json_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "number": { "type": "integer", "description": "Claim number" },
+                "text": { "type": "string", "description": "Claim text" },
+                "status": { "type": "string", "enum": ["matched", "gap", "partial", "ambiguous"], "description": "Validation status" },
+                "location": { "type": "string", "description": "Where in the codebase this claim applies" }
+            },
+            "required": ["number", "text", "status", "location"],
+            "additionalProperties": false
+        })
+    }
 }
 
 pub fn validate(artifact_type: &str, content: &str) -> Result<(), String> {
@@ -145,16 +212,21 @@ description = "JWT-based auth module"
     #[test]
     fn test_validate_execution_plan_valid() {
         let toml = r#"
-[[groups]]
-tasks = [1]
-depends_on = []
-description = "First group"
-
 [[tasks]]
 number = 1
 name = "Setup"
+group = "01"
+depends_on = []
 leverages = []
 description = "Initial setup"
+
+[[tasks]]
+number = 2
+name = "Core logic"
+group = "01"
+depends_on = [1]
+leverages = ["tokio"]
+description = "Implement core"
 "#;
         assert!(validate("execution_plan", toml).is_ok());
     }
@@ -178,7 +250,7 @@ files_changed = ["src/init.rs"]
 [[claims]]
 number = 1
 text = "Module exists"
-status = "pass"
+status = "matched"
 location = "src/lib.rs"
 "#;
         assert!(validate("validation_report", toml).is_ok());
