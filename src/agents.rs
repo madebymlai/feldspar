@@ -170,7 +170,7 @@ pub fn temper(agent: &AgentDef, config: &Config, prefix: &str) -> String {
     output.push_str("\n\n");
 
     let instructions = match agent.interactive.as_str() {
-        "always" => agent.interactive_instructions.as_deref(),
+        "always" | "configurable" => agent.interactive_instructions.as_deref(),
         _ => agent.autonomous_instructions.as_deref(),
     };
     if let Some(instr) = instructions {
