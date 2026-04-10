@@ -7,9 +7,11 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Redirect},
+    response::sse::{Event, Sse},
     routing::{delete, get, post},
     Json,
 };
+use futures_util::stream;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -334,6 +336,10 @@ async fn handle_post(
         for msg in arr {
             match dispatch_message(&state, &headers, msg.clone()).await {
                 DispatchResult::Response(resp, _) => responses.push(resp),
+                DispatchResult::Sse(resp, notifications) => {
+                    for n in notifications { responses.push(n); }
+                    responses.push(resp);
+                }
                 DispatchResult::TransportError(status) => return status.into_response(),
                 DispatchResult::Accepted => {}
             }
@@ -364,6 +370,14 @@ async fn handle_post(
             }
             response
         }
+        DispatchResult::Sse(resp, notifications) => {
+            let mut events: Vec<Result<Event, std::convert::Infallible>> = notifications
+                .into_iter()
+                .map(|n| Ok(Event::default().event("message").data(n.to_string())))
+                .collect();
+            events.push(Ok(Event::default().event("message").data(resp.to_string())));
+            Sse::new(stream::iter(events)).into_response()
+        }
         DispatchResult::TransportError(status) => status.into_response(),
         DispatchResult::Accepted => StatusCode::ACCEPTED.into_response(),
     }
@@ -372,6 +386,8 @@ async fn handle_post(
 enum DispatchResult {
     /// JSON-RPC response at HTTP 200 (with optional session ID for initialize)
     Response(Value, Option<String>),
+    /// SSE stream: notifications followed by the response
+    Sse(Value, Vec<Value>),
     /// Notification/response — return HTTP 202
     Accepted,
     /// Transport-level error — return raw HTTP status (400, 404)
@@ -443,7 +459,19 @@ async fn dispatch_message(
             };
             DispatchResult::Response(handle_tools_list(has_prefix, has_role, is_ar_gated, artifact_type.as_deref(), id), None)
         }
-        "tools/call" => DispatchResult::Response(handle_tools_call(state, headers, id, params).await, None),
+        "tools/call" => {
+            let is_temper = params.as_ref()
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str()) == Some("temper");
+            let resp = handle_tools_call(state, headers, id, params).await;
+            if is_temper && resp.get("result").is_some() {
+                DispatchResult::Sse(resp, vec![
+                    json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+                ])
+            } else {
+                DispatchResult::Response(resp, None)
+            }
+        }
         "ping" => DispatchResult::Response(jsonrpc_result(id, json!({})), None),
         _ => DispatchResult::Response(
             jsonrpc_error(Some(id), -32601, &format!("Method not found: {}", method)),
@@ -1833,10 +1861,25 @@ mod tests {
     }
 
     async fn body_json(resp: axum::response::Response<Body>) -> Value {
+        let content_type = resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+        if content_type.contains("text/event-stream") {
+            // Parse SSE: extract the last data: line (the JSON-RPC response)
+            let text = std::str::from_utf8(&bytes).unwrap();
+            text.lines()
+                .filter(|l| l.starts_with("data:"))
+                .last()
+                .map(|l| serde_json::from_str(l.strip_prefix("data:").unwrap().trim()).unwrap())
+                .unwrap()
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        }
     }
 
     // Helper: do full initialize, return (app, session_id)
@@ -2107,6 +2150,75 @@ mod tests {
         let text = body["result"]["content"][0]["text"].as_str().unwrap();
         assert!(!text.is_empty());
         assert!(text.contains("build agent"));
+    }
+
+    #[tokio::test]
+    async fn test_temper_returns_sse_with_tools_list_changed() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            &session_id,
+        )
+        .await;
+        let content_type = resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.contains("text/event-stream"), "temper must return SSE, got: {}", content_type);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let data_lines: Vec<&str> = text.lines()
+            .filter(|l| l.starts_with("data:"))
+            .collect();
+        assert_eq!(data_lines.len(), 2, "expected 2 SSE data lines (notification + response), got: {:?}", data_lines);
+
+        let notification: Value = serde_json::from_str(data_lines[0].strip_prefix("data:").unwrap().trim()).unwrap();
+        assert_eq!(notification["method"], "notifications/tools/list_changed");
+        assert!(notification.get("id").is_none(), "notification must not have id");
+
+        let response: Value = serde_json::from_str(data_lines[1].strip_prefix("data:").unwrap().trim()).unwrap();
+        assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("build agent"));
+    }
+
+    #[tokio::test]
+    async fn test_non_temper_tools_call_returns_json() {
+        let (app, session_id) = initialized_app().await;
+        // First temper to unlock sequentialthinking
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            &session_id,
+        ).await;
+        // Now call sequentialthinking — should be plain JSON, not SSE
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"sequentialthinking","arguments":{"thought":"test","thoughtNumber":1,"totalThoughts":1,"nextThoughtNeeded":false}}}"#,
+            &session_id,
+        ).await;
+        let content_type = resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.contains("application/json"), "non-temper tools/call must return JSON, got: {}", content_type);
+    }
+
+    #[tokio::test]
+    async fn test_temper_error_returns_json_not_sse() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"nonexistent"}}}"#,
+            &session_id,
+        ).await;
+        let content_type = resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.contains("application/json"), "temper error must return JSON, got: {}", content_type);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
     }
 
     #[tokio::test]
