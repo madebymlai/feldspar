@@ -15,6 +15,10 @@ fn shim_path() -> Option<PathBuf> {
     }
 }
 
+fn is_test_binary(p: &Path) -> bool {
+    p.components().any(|c| c.as_os_str() == "deps")
+}
+
 // ── check_shim ────────────────────────────────────────────────────────────────
 
 pub fn check_shim() -> bool {
@@ -23,11 +27,6 @@ pub fn check_shim() -> bool {
         return false;
     };
 
-    if !shim.exists() {
-        eprintln!("  [FAIL] Shim not found at {}", shim.display());
-        return fix_shim(&shim);
-    }
-
     let my_exe = match std::env::current_exe().and_then(|p| p.canonicalize()) {
         Ok(p) => p,
         Err(_) => {
@@ -35,6 +34,19 @@ pub fn check_shim() -> bool {
             return false;
         }
     };
+
+    // Running as a cargo test binary: we can't validate or repair the shim
+    // without pointing it at the test binary under target/<profile>/deps/.
+    // Bail out without touching the real shim.
+    if is_test_binary(&my_exe) {
+        eprintln!("  [SKIP] Running from test binary; shim check skipped");
+        return true;
+    }
+
+    if !shim.exists() {
+        eprintln!("  [FAIL] Shim not found at {}", shim.display());
+        return fix_shim(&shim);
+    }
 
     if let Ok(resolved) = shim.canonicalize() {
         if resolved != my_exe {
@@ -55,6 +67,14 @@ fn fix_shim(shim: &Path) -> bool {
             return false;
         }
     };
+
+    if is_test_binary(&feldspar_bin) {
+        eprintln!(
+            "  [FAIL] Refusing to shim test binary at {}",
+            feldspar_bin.display()
+        );
+        return false;
+    }
 
     let _ = std::fs::remove_file(shim);
     if let Some(parent) = shim.parent() {
@@ -294,12 +314,44 @@ mod tests {
     }
 
     #[test]
-    fn test_check_shim_missing() {
-        // When shim file does not exist, check_shim attempts to recreate it.
-        // We cannot control the outcome without the real binary context, but we
-        // can verify the function returns a bool without panicking.
-        let result = std::panic::catch_unwind(check_shim);
-        assert!(result.is_ok(), "check_shim must not panic");
+    fn test_is_test_binary_detects_deps() {
+        // Cargo runs test binaries from target/<profile>/deps/, so our own
+        // current_exe() during `cargo test` must be recognised as a test binary.
+        let exe = std::env::current_exe().expect("current_exe in test");
+        assert!(
+            is_test_binary(&exe),
+            "test binary must be detected as test binary: {}",
+            exe.display()
+        );
+    }
+
+    #[test]
+    fn test_check_shim_skips_under_test() {
+        // check_shim() must not mutate the real ~/feldspar/bin/claude symlink
+        // when invoked from a cargo test binary. It should return true and do
+        // nothing. We verify it returns without panicking; the destructive
+        // side-effect path is gated by the is_test_binary() early return.
+        assert!(
+            check_shim(),
+            "check_shim must be a no-op success under cargo test"
+        );
+    }
+
+    #[test]
+    fn test_fix_shim_refuses_test_binary() {
+        use tempfile::TempDir;
+        // fix_shim() must refuse to link when current_exe() is a test binary,
+        // to avoid pointing ~/feldspar/bin/claude at the test runner.
+        let tmp = TempDir::new().unwrap();
+        let fake_shim = tmp.path().join("claude");
+        assert!(
+            !fix_shim(&fake_shim),
+            "fix_shim must refuse to create a link to a test binary"
+        );
+        assert!(
+            !fake_shim.exists(),
+            "fix_shim must not create the shim file when refusing"
+        );
     }
 
     #[cfg(unix)]
