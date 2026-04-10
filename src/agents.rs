@@ -22,20 +22,23 @@ const UNIVERSAL_WARNINGS: &[&str] = &[
     "PATTERN_RISK: ML found similar poor traces — adjust approach",
 ];
 
+const SHUTDOWN_PROTOCOL: &str = r#"When you receive a shutdown_request message, use the SendMessage tool
+to reply to the team lead with this exact JSON as the message parameter:
+{"type": "shutdown_response", "request_id": "[request_id]", "approve": true}
+Do NOT print this as text. You MUST use the SendMessage tool. Then stop all work."#;
+
 #[derive(Debug, Deserialize)]
 struct RawAgentToml {
     agent: RawAgentSection,
     prompt: RawPromptSection,
-    warnings: RawWarningsSection,
-    shutdown: RawShutdownSection,
+    rules: RawRulesSection,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawAgentSection {
     name: String,
     artifact_type: String,
-    interactive: String,
-    team: bool,
+    interactive: String, // "always" | "never" | "configurable"
     ar_gated: bool,
     thinking_mode: String,
     #[serde(default)]
@@ -45,29 +48,32 @@ struct RawAgentSection {
 #[derive(Debug, Deserialize)]
 struct RawPromptSection {
     identity: String,
+    #[serde(default)]
+    interactive: Option<RawModePrompt>,
+    #[serde(default)]
+    autonomous: Option<RawModePrompt>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawModePrompt {
     instructions: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct RawWarningsSection {
+struct RawRulesSection {
     mode: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawShutdownSection {
-    instruction: String,
 }
 
 pub struct AgentDef {
     pub name: String,
     pub artifact_type: String,
     pub interactive: String,
-    pub team: bool,
     pub ar_gated: bool,
     pub thinking_mode: String,
-    pub prompt: String,
-    pub mode_warnings: Vec<String>,
-    pub shutdown: String,
+    pub identity: String,
+    pub interactive_instructions: Option<String>,
+    pub autonomous_instructions: Option<String>,
+    pub rules: Vec<String>,
     pub fetches: Vec<String>,
 }
 
@@ -76,16 +82,12 @@ fn parse_agent_def(raw: RawAgentToml) -> AgentDef {
         name: raw.agent.name.clone(),
         artifact_type: raw.agent.artifact_type,
         interactive: raw.agent.interactive,
-        team: raw.agent.team,
         ar_gated: raw.agent.ar_gated,
         thinking_mode: raw.agent.thinking_mode,
-        prompt: format!(
-            "{}\n\n{}",
-            raw.prompt.identity.trim(),
-            raw.prompt.instructions.trim()
-        ),
-        mode_warnings: raw.warnings.mode,
-        shutdown: raw.shutdown.instruction,
+        identity: raw.prompt.identity.trim().to_owned(),
+        interactive_instructions: raw.prompt.interactive.map(|m| m.instructions.trim().to_owned()),
+        autonomous_instructions: raw.prompt.autonomous.map(|m| m.instructions.trim().to_owned()),
+        rules: raw.rules.mode,
         fetches: raw.agent.fetches,
     }
 }
@@ -164,8 +166,17 @@ pub fn temper(agent: &AgentDef, config: &Config, prefix: &str) -> String {
 
     output.push_str(&format!("PREFIX: {}\n\n", prefix));
 
-    output.push_str(&agent.prompt);
+    output.push_str(&agent.identity);
     output.push_str("\n\n");
+
+    let instructions = match agent.interactive.as_str() {
+        "always" => agent.interactive_instructions.as_deref(),
+        _ => agent.autonomous_instructions.as_deref(),
+    };
+    if let Some(instr) = instructions {
+        output.push_str(instr);
+        output.push_str("\n\n");
+    }
 
     let active_principles: Vec<_> = config.principles.iter().filter(|g| g.active).collect();
     if !active_principles.is_empty() {
@@ -184,16 +195,16 @@ pub fn temper(agent: &AgentDef, config: &Config, prefix: &str) -> String {
     }
     output.push('\n');
 
-    if !agent.mode_warnings.is_empty() {
-        output.push_str("## Mode-Specific Rules\n\n");
-        for w in &agent.mode_warnings {
-            output.push_str(&format!("- {}\n", w));
+    if !agent.rules.is_empty() {
+        output.push_str("## Rules\n\n");
+        for r in &agent.rules {
+            output.push_str(&format!("- {}\n", r));
         }
         output.push('\n');
     }
 
     output.push_str("## Shutdown Protocol\n\n");
-    output.push_str(agent.shutdown.trim());
+    output.push_str(SHUTDOWN_PROTOCOL);
 
     if agent.ar_gated {
         output.push_str("\n\n## Artifact Protocol\n\n");
@@ -247,9 +258,32 @@ mod tests {
         for (name, def) in &agents {
             assert!(!def.name.is_empty(), "{}: name is empty", name);
             assert!(!def.thinking_mode.is_empty(), "{}: thinking_mode is empty", name);
-            assert!(!def.prompt.is_empty(), "{}: prompt is empty", name);
-            assert!(!def.shutdown.is_empty(), "{}: shutdown is empty", name);
+            assert!(!def.identity.is_empty(), "{}: identity is empty", name);
         }
+    }
+
+    #[test]
+    fn test_arm_interactive_only() {
+        let agents = load_agents("test");
+        let arm = agents.get("arm").unwrap();
+        assert!(arm.interactive_instructions.is_some(), "arm must have interactive_instructions");
+        assert!(arm.autonomous_instructions.is_none(), "arm must not have autonomous_instructions");
+    }
+
+    #[test]
+    fn test_orchestrator_autonomous_only() {
+        let agents = load_agents("test");
+        let orch = agents.get("orchestrator").unwrap();
+        assert!(orch.autonomous_instructions.is_some(), "orchestrator must have autonomous_instructions");
+        assert!(orch.interactive_instructions.is_none(), "orchestrator must not have interactive_instructions");
+    }
+
+    #[test]
+    fn test_solve_has_both_modes() {
+        let agents = load_agents("test");
+        let solve = agents.get("solve").unwrap();
+        assert!(solve.interactive_instructions.is_some(), "solve must have interactive_instructions");
+        assert!(solve.autonomous_instructions.is_some(), "solve must have autonomous_instructions");
     }
 
     fn test_config_with_principles() -> Config {
@@ -319,6 +353,38 @@ mod tests {
     }
 
     #[test]
+    fn test_temper_includes_identity() {
+        let agents = load_agents("test");
+        let agent = agents.get("build").unwrap();
+        let config = test_config_empty_principles();
+        let output = temper(agent, &config, "test");
+        assert!(output.contains(&agent.identity), "output must contain agent identity");
+    }
+
+    #[test]
+    fn test_temper_arm_uses_interactive_instructions() {
+        let agents = load_agents("test");
+        let agent = agents.get("arm").unwrap();
+        let config = test_config_empty_principles();
+        let output = temper(agent, &config, "test");
+        // Check a distinctive phrase from arm interactive instructions
+        assert!(output.contains("Talk to the user"), "arm temper must contain interactive instructions");
+        if let Some(auto_instr) = agent.autonomous_instructions.as_deref() {
+            assert!(!output.contains(auto_instr), "arm temper must not contain autonomous instructions");
+        }
+    }
+
+    #[test]
+    fn test_temper_build_uses_autonomous_instructions() {
+        let agents = load_agents("test");
+        let agent = agents.get("build").unwrap();
+        let config = test_config_empty_principles();
+        let output = temper(agent, &config, "test");
+        let instr = agent.autonomous_instructions.as_deref().unwrap();
+        assert!(output.contains(instr), "build temper must contain autonomous instructions");
+    }
+
+    #[test]
     fn test_temper_includes_principles() {
         let agents = load_agents("test");
         let agent = agents.get("build").unwrap();
@@ -336,7 +402,17 @@ mod tests {
         let config = test_config_empty_principles();
         let output = temper(agent, &config, "test");
         assert!(output.contains("ANTI-QUICK-FIX"), "missing universal warning");
-        assert!(output.contains("Must stay focused on task scope"), "missing mode warning");
+        assert!(output.contains("Must stay focused on task scope"), "missing mode rule");
+    }
+
+    #[test]
+    fn test_temper_includes_rules() {
+        let agents = load_agents("test");
+        let agent = agents.get("build").unwrap();
+        let config = test_config_empty_principles();
+        let output = temper(agent, &config, "test");
+        assert!(output.contains("## Rules"), "missing Rules section");
+        assert!(!agent.rules.is_empty(), "build must have rules");
     }
 
     #[test]
@@ -346,6 +422,7 @@ mod tests {
         let config = test_config_empty_principles();
         let output = temper(agent, &config, "test");
         assert!(output.contains("SendMessage tool"), "missing shutdown protocol");
+        assert!(output.contains("shutdown_response"), "missing shutdown_response in protocol");
     }
 
     #[test]
@@ -383,7 +460,6 @@ mod tests {
 
     #[test]
     fn test_load_agents_embedded_only() {
-        // Nonexistent project → only 7 embedded agents returned
         let agents = load_agents("__nonexistent_project_for_test__");
         assert_eq!(agents.len(), 7, "expected exactly 7 embedded agents");
     }
@@ -396,20 +472,18 @@ mod tests {
 [agent]
 name = "custom-test"
 artifact_type = "code"
-interactive = "background"
-team = true
+interactive = "never"
 ar_gated = false
 thinking_mode = "custom"
 
 [prompt]
 identity = "Custom test agent."
+
+[prompt.autonomous]
 instructions = "Do the thing."
 
-[warnings]
+[rules]
 mode = []
-
-[shutdown]
-instruction = "Send shutdown_response."
 "#;
         std::fs::write(tmp.path().join("custom-test.toml"), agent_toml).unwrap();
 
@@ -424,25 +498,22 @@ instruction = "Send shutdown_response."
     fn test_custom_agent_overrides_embedded() {
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
-        // Write agent named "build" to override embedded
         let agent_toml = r#"
 [agent]
 name = "build"
 artifact_type = "docs"
-interactive = "foreground"
-team = false
+interactive = "never"
 ar_gated = false
 thinking_mode = "custom-build"
 
 [prompt]
 identity = "Custom build override."
+
+[prompt.autonomous]
 instructions = "Custom instructions."
 
-[warnings]
+[rules]
 mode = ["CUSTOM_WARNING"]
-
-[shutdown]
-instruction = "Custom shutdown."
 "#;
         std::fs::write(tmp.path().join("build.toml"), agent_toml).unwrap();
 
@@ -461,7 +532,6 @@ instruction = "Custom shutdown."
         std::fs::write(tmp.path().join("bad.toml"), "not valid toml [[[[").unwrap();
 
         let mut agents = HashMap::new();
-        // Should not panic
         load_custom_agents(&mut agents, tmp.path());
         assert_eq!(agents.len(), 0);
     }

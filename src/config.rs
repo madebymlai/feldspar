@@ -339,7 +339,6 @@ mod tests {
         let names: Vec<&str> = config.principles.iter().map(|g| g.name.as_str()).collect();
         assert!(names.contains(&"solid"));
         assert!(names.contains(&"kiss-dry"));
-        assert!(names.contains(&"tdd"));
         assert!(!names.contains(&"security"));
     }
 

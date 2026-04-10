@@ -106,26 +106,6 @@ ask = [
     "Am I inspecting data to decide behavior instead of delegating it?",
 ]
 
-[groups.tdd]
-active = true
-
-[[groups.tdd.principles]]
-name = "Test-Driven Development"
-rule = "Tests written with the code, not after. Red → Green → Refactor."
-ask = [
-    "Did I write the test before the implementation?",
-    "Does the test fail for the right reason before I fix it?",
-    "Did I refactor after going green?",
-]
-
-[[groups.tdd.principles]]
-name = "Test at boundaries"
-rule = "Validate at system boundaries. Trust internals."
-ask = [
-    "Am I testing implementation details or behavior?",
-    "Would refactoring break this test even if behavior is unchanged?",
-]
-
 [groups.security]
 active = false
 
