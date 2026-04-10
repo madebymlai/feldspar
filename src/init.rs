@@ -289,6 +289,13 @@ pub fn setup_shim() -> Result<(), String> {
     let feldspar_bin = std::env::current_exe()
         .map_err(|e| format!("cannot find own binary: {e}"))?;
 
+    if feldspar_bin.components().any(|c| c.as_os_str() == "deps") {
+        return Err(format!(
+            "refusing to shim test binary at {}. Run `cargo run -- init` or install the release binary.",
+            feldspar_bin.display()
+        ));
+    }
+
     let shim_dir = dirs::home_dir()
         .ok_or("cannot find home directory")?
         .join("feldspar/bin");
@@ -557,6 +564,16 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(v["mcpServers"]["other-server"].is_object(), "other server should be preserved");
         assert!(v["mcpServers"]["feldspar"].is_object(), "feldspar entry should be added");
+    }
+
+    #[test]
+    fn test_setup_shim_rejects_test_binary() {
+        // The test binary itself lives under target/<profile>/deps/, so
+        // setup_shim() must refuse to link to it.
+        let result = setup_shim();
+        assert!(result.is_err(), "setup_shim must reject test binary");
+        let err = result.unwrap_err();
+        assert!(err.contains("test binary"), "error should mention test binary: {}", err);
     }
 
     #[test]
