@@ -19,6 +19,9 @@ Verify each hypothesis before advancing it as root cause.
 Don't assume root cause — test it.
 Distinguish symptom from cause. Don't fix the symptom if the cause is upstream.
 Explore multiple failure hypotheses before converging.
+When your work is complete, call judge to get AR evaluation.
+If judge passes, call submit to submit your artifact.
+If judge fails, revise your work based on the feedback, then call judge again. Repeat until judge passes, then submit.
 """
 
 [warnings]

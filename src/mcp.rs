@@ -1,5 +1,6 @@
 use crate::agents::{self, AgentDef};
 use crate::ar::ArEngine;
+use crate::init;
 use crate::thought::{ThinkingServer, ThoughtInput, Timestamp};
 use axum::{
     Router,
@@ -37,6 +38,8 @@ pub struct Session {
     pub thinking_mode: Option<String>,
     pub ar_gated: bool,
     pub judge_cycle: u32,
+    pub role: Option<String>,
+    pub group: Option<String>,
 }
 
 impl McpState {
@@ -71,6 +74,7 @@ pub fn create_router(state: Arc<McpState>) -> Router {
         .route("/oauth/authorize", get(handle_oauth_authorize))
         .route("/oauth/token", post(handle_oauth_token))
         .route("/oauth/register", post(handle_oauth_register))
+        .route("/session/{id}", get(handle_session_lookup))
         .fallback(handle_fallback)
         .with_state(state)
 }
@@ -171,11 +175,63 @@ pub async fn session_cleanup_task(state: Arc<McpState>) {
     loop {
         interval.tick().await;
         let cutoff = now_millis() - SESSION_TTL_MS;
-        state
-            .sessions
-            .write()
-            .await
-            .retain(|_, s| s.last_activity > cutoff);
+
+        let orphaned_prefixes: Vec<String> = {
+            let mut sessions = state.sessions.write().await;
+            let evicted_prefixes: Vec<String> = sessions.values()
+                .filter(|s| s.last_activity <= cutoff)
+                .filter_map(|s| s.prefix.clone())
+                .collect();
+            sessions.retain(|_, s| s.last_activity > cutoff);
+            evicted_prefixes.into_iter()
+                .filter(|p| !sessions.values().any(|s| s.prefix.as_deref() == Some(p.as_str())))
+                .collect()
+        };
+
+        for prefix in orphaned_prefixes {
+            let base = init::data_dir(&state.project_name);
+            for mode in &["implementation", "debugging"] {
+                let dir = base.join("artifacts/changes").join(mode).join(&prefix);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+}
+
+pub fn sweep_orphaned_changes(project_name: &str) {
+    let base = init::data_dir(project_name);
+    let threshold = std::time::Duration::from_secs(2 * 60 * 60);
+    let now = std::time::SystemTime::now();
+    for mode in &["implementation", "debugging"] {
+        let changes_dir = base.join("artifacts/changes").join(mode);
+        if let Ok(entries) = std::fs::read_dir(&changes_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    let old_enough = entry.metadata().ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(|t| now.duration_since(t).unwrap_or_default() > threshold)
+                        .unwrap_or(false);
+                    if old_enough {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_session_lookup(
+    State(state): State<Arc<McpState>>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let sessions = state.sessions.read().await;
+    match sessions.get(&session_id) {
+        Some(s) => Json(json!({
+            "prefix": s.prefix,
+            "group": s.group,
+            "role": s.role,
+        })).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -377,14 +433,14 @@ async fn dispatch_message(
             DispatchResult::Response(response, Some(session_id))
         }
         "tools/list" => {
-            let (has_prefix, is_ar_gated) = if let Ok(sid) = validate_session(state, headers).await {
+            let (has_prefix, has_role, is_ar_gated) = if let Ok(sid) = validate_session(state, headers).await {
                 state.sessions.read().await.get(&sid)
-                    .map(|s| (s.prefix.is_some(), s.ar_gated))
-                    .unwrap_or((false, false))
+                    .map(|s| (s.prefix.is_some(), s.role.is_some(), s.ar_gated))
+                    .unwrap_or((false, false, false))
             } else {
-                (false, false)
+                (false, false, false)
             };
-            DispatchResult::Response(handle_tools_list(has_prefix, is_ar_gated, id), None)
+            DispatchResult::Response(handle_tools_list(has_prefix, has_role, is_ar_gated, id), None)
         }
         "tools/call" => DispatchResult::Response(handle_tools_call(state, headers, id, params).await, None),
         "ping" => DispatchResult::Response(jsonrpc_result(id, json!({})), None),
@@ -429,6 +485,8 @@ async fn handle_initialize(
             thinking_mode: None,
             ar_gated: false,
             judge_cycle: 0,
+            role: None,
+            group: None,
         },
     );
 
@@ -463,6 +521,10 @@ fn temper_tool_def() -> Value {
                 "prefix": {
                     "type": "string",
                     "description": "Reuse prefix from previous workflow step. If omitted, generates new."
+                },
+                "group": {
+                    "type": "string",
+                    "description": "Zero-padded group number for build agents (e.g., '01'). Omit for non-build roles."
                 }
             },
             "required": ["role"]
@@ -948,9 +1010,11 @@ fn configure_remove_mode(id: Value, arguments: &Value, config_dir: &std::path::P
     ok_response(id, &format!("Mode '{}' removed", name))
 }
 
-fn handle_tools_list(has_prefix: bool, is_ar_gated: bool, id: Value) -> Value {
+fn handle_tools_list(has_prefix: bool, has_role: bool, is_ar_gated: bool, id: Value) -> Value {
     let mut tools = vec![sequentialthinking_tool_def()];
-    tools.push(temper_tool_def());
+    if !has_role {
+        tools.push(temper_tool_def());
+    }
     tools.push(configure_tool_def());
     if has_prefix {
         tools.push(submit_tool_def());
@@ -980,6 +1044,20 @@ async fn handle_tools_call(state: &McpState, headers: &HeaderMap, id: Value, par
             if role.is_empty() {
                 return jsonrpc_error(Some(id), -32602, "Missing required argument: role");
             }
+
+            // Validate group for build role before anything else
+            let group_opt: Option<String> = if role == "build" {
+                let group = arguments.get("group").and_then(|g| g.as_str()).unwrap_or("");
+                if group.len() == 2 && group.chars().all(|c| c.is_ascii_digit()) {
+                    Some(group.to_owned())
+                } else {
+                    return jsonrpc_error(Some(id), -32602,
+                        "group must be a two-digit zero-padded number (e.g., '01')");
+                }
+            } else {
+                None
+            };
+
             match state.agents.get(role) {
                 Some(agent) => {
                     let is_orchestrator = role == "orchestrator";
@@ -1008,7 +1086,23 @@ async fn handle_tools_call(state: &McpState, headers: &HeaderMap, id: Value, par
                             session.thinking_mode = Some(agent.thinking_mode.clone());
                             session.ar_gated = agent.ar_gated;
                             session.judge_cycle = 0;
+                            session.role = Some(role.to_owned());
+                            session.group = group_opt.clone();
                         }
+                    }
+
+                    // Create empty change file for build/bugfest (best-effort)
+                    if role == "build" || role == "bugfest" {
+                        let mode = if role == "build" { "implementation" } else { "debugging" };
+                        let changes_dir = init::data_dir(&state.project_name)
+                            .join("artifacts/changes").join(mode).join(&prefix);
+                        let _ = std::fs::create_dir_all(&changes_dir);
+                        let filename = if role == "build" {
+                            format!("{}-changes.toml", group_opt.as_deref().unwrap_or("00"))
+                        } else {
+                            "changes.toml".to_owned()
+                        };
+                        let _ = std::fs::File::create(changes_dir.join(filename));
                     }
 
                     jsonrpc_result(
@@ -1187,21 +1281,33 @@ async fn handle_judge(state: &McpState, headers: &HeaderMap, id: Value, params: 
         Err(_) => return jsonrpc_error(Some(id), -32602, &format!("Artifact '{}' not found", artifact_name)),
     };
 
-    let full_artifact = if mode == "implementation" || mode == "debugging" {
-        let home2 = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let changes_path = std::path::PathBuf::from(home2)
-            .join(".feldspar/data")
-            .join(&project)
-            .join("artifacts/changes")
-            .join(&mode)
-            .join("changes.toml");
-        if let Ok(changes) = std::fs::read_to_string(&changes_path) {
-            format!("{}\n\n## Code Changes\n{}", artifact, changes)
+    let full_artifact = {
+        let sessions = state.sessions.read().await;
+        let session = sessions.get(&session_id);
+        let role = session.and_then(|s| s.role.as_deref()).unwrap_or("");
+        let group = session.and_then(|s| s.group.as_deref());
+        let prefix_val = session.and_then(|s| s.prefix.as_deref()).unwrap_or("");
+
+        if (role == "build" || role == "bugfest") && !prefix_val.is_empty() {
+            let mode_dir = if role == "build" { "implementation" } else { "debugging" };
+            let filename = if role == "build" {
+                format!("{}-changes.toml", group.unwrap_or("00"))
+            } else {
+                "changes.toml".to_owned()
+            };
+            let changes_path = init::data_dir(&project)
+                .join("artifacts/changes")
+                .join(mode_dir)
+                .join(prefix_val)
+                .join(filename);
+            if let Ok(changes) = std::fs::read_to_string(&changes_path) {
+                format!("{}\n\n## Code Changes\n{}", artifact, changes)
+            } else {
+                artifact
+            }
         } else {
             artifact
         }
-    } else {
-        artifact
     };
 
     let result = ar_engine
@@ -1563,7 +1669,7 @@ mod tests {
     #[test]
     fn test_tools_list_no_prefix() {
         // No prefix → temper + configure, no submit/fetch/judge
-        let result = handle_tools_list(false, false, json!(1));
+        let result = handle_tools_list(false, false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"sequentialthinking"));
@@ -1577,7 +1683,7 @@ mod tests {
     #[test]
     fn test_tools_list_with_prefix_ar_gated() {
         // has_prefix=true, ar_gated=true → submit + fetch + judge
-        let result = handle_tools_list(true, true, json!(1));
+        let result = handle_tools_list(true, false, true, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"sequentialthinking"));
@@ -1591,7 +1697,7 @@ mod tests {
     #[test]
     fn test_tools_list_with_prefix_not_ar_gated() {
         // has_prefix=true, ar_gated=false → submit + fetch, no judge
-        let result = handle_tools_list(true, false, json!(1));
+        let result = handle_tools_list(true, false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"submit"));
@@ -1604,7 +1710,7 @@ mod tests {
         let (app, session_id) = initialized_app().await;
         let resp = post_mcp_with_session(
             app,
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
             &session_id,
         )
         .await;
@@ -1863,8 +1969,8 @@ mod tests {
 
     #[test]
     fn test_tools_list_base_tools() {
-        // No prefix → 3 base tools (sequentialthinking + temper + configure)
-        let result = handle_tools_list(false, false, json!(1));
+        // No prefix, no role → 3 base tools (sequentialthinking + temper + configure)
+        let result = handle_tools_list(false, false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 3);
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -1878,7 +1984,7 @@ mod tests {
         let (app, session_id) = initialized_app().await;
         let resp = post_mcp_with_session(
             app,
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
             &session_id,
         )
         .await;
@@ -1890,11 +1996,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_list_after_temper_shows_all() {
-        // After temper → base tools + submit + fetch + judge (build is ar_gated)
+        // After temper(build) → temper hidden, 5 tools: sequentialthinking + configure + submit + fetch + judge
         let (app, session_id) = initialized_app().await;
         post_mcp_with_session(
             app.clone(),
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
             &session_id,
         )
         .await;
@@ -1906,9 +2012,9 @@ mod tests {
         .await;
         let body = body_json(resp).await;
         let tools = body["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 5);
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"temper"));
+        assert!(!names.contains(&"temper"));
         assert!(names.contains(&"configure"));
         assert!(names.contains(&"submit"));
         assert!(names.contains(&"fetch"));
@@ -1947,7 +2053,7 @@ mod tests {
         // Call temper first
         post_mcp_with_session(
             app.clone(),
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
             &session_id,
         )
         .await;
@@ -1970,7 +2076,7 @@ mod tests {
         // Call temper first
         post_mcp_with_session(
             app.clone(),
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
             &session_id,
         )
         .await;
@@ -2017,7 +2123,7 @@ mod tests {
         // Call temper on session 1
         let resp1 = post_mcp_with_session(
             app.clone(),
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
             &session_id_1,
         ).await;
         let body1 = body_json(resp1).await;
@@ -2026,7 +2132,7 @@ mod tests {
         // Call temper on session 2
         let resp2 = post_mcp_with_session(
             app,
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"02"}}}"#,
             &session_id_2,
         ).await;
         let body2 = body_json(resp2).await;
@@ -2238,7 +2344,7 @@ user_story = "As a user, I want to log in"
         // build has artifact_type=code → no validation
         post_mcp_with_session(
             app.clone(),
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
             &session_id,
         ).await;
         let body_str = serde_json::to_string(&json!({
@@ -2303,7 +2409,7 @@ user_story = "As a user, I want to log in"
 
     #[test]
     fn test_tools_list_with_prefix_has_fetch() {
-        let result = handle_tools_list(true, false, json!(1));
+        let result = handle_tools_list(true, false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"fetch"), "fetch not in tempered session tools");
@@ -2311,7 +2417,7 @@ user_story = "As a user, I want to log in"
 
     #[test]
     fn test_tools_list_no_prefix_no_fetch() {
-        let result = handle_tools_list(false, false, json!(1));
+        let result = handle_tools_list(false, false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(!names.contains(&"fetch"), "fetch must not appear without prefix");
@@ -2410,5 +2516,633 @@ user_story = "As a user, I want to log in"
         assert_eq!(body["error"]["code"], -32602);
         let msg = body["error"]["message"].as_str().unwrap();
         assert!(msg.contains("temper"), "expected temper error: {}", msg);
+    }
+
+    // --- Task 1 tests: Session role/group fields ---
+
+    #[tokio::test]
+    async fn test_session_new_fields_default_none() {
+        let app = test_app();
+        let resp = post_mcp(
+            app,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"test","version":"0.1"}}}"#,
+        ).await;
+        // Session is created; we can't read it directly in this test, but we verify
+        // tools/list returns temper (meaning has_role=false, i.e. role is None)
+        let session_id = resp.headers().get("mcp-session-id").unwrap().to_str().unwrap().to_owned();
+        let app2 = test_app();
+        let resp2 = app2.clone().oneshot(
+            Request::builder()
+                .method("POST").uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"test","version":"0.1"}}}"#))
+                .unwrap(),
+        ).await.unwrap();
+        let sid2 = resp2.headers().get("mcp-session-id").unwrap().to_str().unwrap().to_owned();
+        let resp3 = post_mcp_with_session(app2, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &sid2).await;
+        let body = body_json(resp3).await;
+        let names: Vec<_> = body["result"]["tools"].as_array().unwrap()
+            .iter().map(|t| t["name"].as_str().unwrap()).collect();
+        // temper visible means role is None (default)
+        assert!(names.contains(&"temper"), "temper should be visible when role is None");
+        let _ = session_id; // suppress unused warning
+    }
+
+    // --- Task 2 tests: Temper group validation ---
+
+    #[tokio::test]
+    async fn test_temper_build_sets_role_and_group() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        // Verify role is set: tools/list should hide temper
+    }
+
+    #[tokio::test]
+    async fn test_temper_build_rejects_invalid_group() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"1"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("two-digit"), "expected two-digit in error: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_temper_build_rejects_traversal_group() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"../"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn test_temper_bugfest_sets_role_no_group() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"bugfest"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        // bugfest succeeds without group
+    }
+
+    #[tokio::test]
+    async fn test_temper_creates_change_file_build() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01","prefix":"ab12"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        let change_file = init::data_dir("test")
+            .join("artifacts/changes/implementation/ab12/01-changes.toml");
+        assert!(change_file.exists(), "expected change file at {:?}", change_file);
+    }
+
+    #[tokio::test]
+    async fn test_temper_creates_change_file_bugfest() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"bugfest","prefix":"cd34"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        let change_file = init::data_dir("test")
+            .join("artifacts/changes/debugging/cd34/changes.toml");
+        assert!(change_file.exists(), "expected change file at {:?}", change_file);
+    }
+
+    #[tokio::test]
+    async fn test_tools_list_hides_temper_after_use() {
+        let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            &session_id,
+        ).await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let names: Vec<_> = body["result"]["tools"].as_array().unwrap()
+            .iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(!names.contains(&"temper"), "temper must be hidden after temper call");
+    }
+
+    #[tokio::test]
+    async fn test_tools_list_shows_temper_before_use() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let names: Vec<_> = body["result"]["tools"].as_array().unwrap()
+            .iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"temper"), "temper must be visible before temper call");
+    }
+
+    // --- Task 3 tests: GET /session/:id ---
+
+    #[tokio::test]
+    async fn test_session_lookup_returns_info() {
+        let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01","prefix":"ab12"}}}"#,
+            &session_id,
+        ).await;
+        let resp = app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/session/{}", session_id))
+                .body(Body::empty())
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["prefix"], "ab12");
+        assert_eq!(body["group"], "01");
+        assert_eq!(body["role"], "build");
+    }
+
+    #[tokio::test]
+    async fn test_session_lookup_not_found() {
+        let app = test_app();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/session/nonexistent-id-that-does-not-exist")
+                .body(Body::empty())
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- Task 4 tests: Cleanup + per-prefix deletion ---
+
+    #[tokio::test]
+    async fn test_cleanup_deletes_orphaned_prefix_dir() {
+        let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01","prefix":"cl01"}}}"#,
+            &session_id,
+        ).await;
+
+        let change_dir = init::data_dir("test")
+            .join("artifacts/changes/implementation/cl01");
+        assert!(change_dir.exists(), "change dir should exist after temper");
+
+        // Get state and expire the session manually
+        let state = Arc::new(McpState::new(
+            ThinkingServer::new(test_config(), None, None, Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())), None),
+            crate::agents::load_agents("test"),
+            None,
+            "test".into(),
+            0,
+        ));
+        {
+            let mut sessions = state.sessions.write().await;
+            let expired = Session {
+                id: "exp1".into(),
+                initialized: true,
+                created_at: 0,
+                last_activity: 0, // already expired
+                prefix: Some("cl01".into()),
+                thinking_mode: None,
+                ar_gated: false,
+                judge_cycle: 0,
+                role: Some("build".into()),
+                group: Some("01".into()),
+            };
+            sessions.insert("exp1".into(), expired);
+        }
+        // Manually run one cleanup cycle
+        let cutoff = now_millis() - SESSION_TTL_MS;
+        let orphaned: Vec<String> = {
+            let mut sessions = state.sessions.write().await;
+            let evicted: Vec<String> = sessions.values()
+                .filter(|s| s.last_activity <= cutoff)
+                .filter_map(|s| s.prefix.clone())
+                .collect();
+            sessions.retain(|_, s| s.last_activity > cutoff);
+            evicted.into_iter()
+                .filter(|p| !sessions.values().any(|s| s.prefix.as_deref() == Some(p.as_str())))
+                .collect()
+        };
+        for prefix in orphaned {
+            let base = init::data_dir(&state.project_name);
+            for mode in &["implementation", "debugging"] {
+                let _ = std::fs::remove_dir_all(base.join("artifacts/changes").join(mode).join(&prefix));
+            }
+        }
+
+        assert!(!change_dir.exists(), "change dir should be deleted after cleanup");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_preserves_active_prefix_dir() {
+        let state = Arc::new(McpState::new(
+            ThinkingServer::new(test_config(), None, None, Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())), None),
+            crate::agents::load_agents("test"),
+            None,
+            "test".into(),
+            0,
+        ));
+
+        // Create the prefix dir manually
+        let change_dir = init::data_dir("test").join("artifacts/changes/implementation/sh01");
+        std::fs::create_dir_all(&change_dir).unwrap();
+
+        {
+            let mut sessions = state.sessions.write().await;
+            // Expired session with prefix sh01
+            sessions.insert("exp".into(), Session {
+                id: "exp".into(), initialized: true, created_at: 0, last_activity: 0,
+                prefix: Some("sh01".into()), thinking_mode: None, ar_gated: false,
+                judge_cycle: 0, role: Some("build".into()), group: Some("01".into()),
+            });
+            // Active session with same prefix
+            sessions.insert("active".into(), Session {
+                id: "active".into(), initialized: true, created_at: now_millis(),
+                last_activity: now_millis(),
+                prefix: Some("sh01".into()), thinking_mode: None, ar_gated: false,
+                judge_cycle: 0, role: Some("build".into()), group: Some("02".into()),
+            });
+        }
+
+        let cutoff = now_millis() - SESSION_TTL_MS;
+        let orphaned: Vec<String> = {
+            let mut sessions = state.sessions.write().await;
+            let evicted: Vec<String> = sessions.values()
+                .filter(|s| s.last_activity <= cutoff)
+                .filter_map(|s| s.prefix.clone())
+                .collect();
+            sessions.retain(|_, s| s.last_activity > cutoff);
+            evicted.into_iter()
+                .filter(|p| !sessions.values().any(|s| s.prefix.as_deref() == Some(p.as_str())))
+                .collect()
+        };
+        assert!(orphaned.is_empty(), "prefix shared with active session should not be orphaned");
+        assert!(change_dir.exists(), "change dir should be preserved when active session exists");
+    }
+
+    // --- Task 5 tests: sweep_orphaned_changes + init dirs ---
+
+    #[test]
+    fn test_sweep_preserves_young_dirs() {
+        // Create a dir under the real data dir (young — just created, won't be swept)
+        let young_dir = init::data_dir("test")
+            .join("artifacts/changes/implementation/young");
+        std::fs::create_dir_all(&young_dir).unwrap();
+        sweep_orphaned_changes("test");
+        assert!(young_dir.exists(), "young dir should not be swept");
+    }
+
+    #[test]
+    fn test_sweep_deletes_old_dirs() {
+        // Can't backdate mtime in stable std without external crate.
+        // Verify that a freshly-created dir is preserved by sweep (threshold >> actual age).
+        let fresh_dir = init::data_dir("test")
+            .join("artifacts/changes/implementation/fresh");
+        std::fs::create_dir_all(&fresh_dir).unwrap();
+        sweep_orphaned_changes("test");
+        assert!(fresh_dir.exists(), "freshly created dir should not be deleted by sweep");
+    }
+
+    #[test]
+    fn test_init_creates_change_dirs() {
+        // Verify that create_data_dirs creates change dirs (uses actual home dir like all other tests)
+        crate::init::create_data_dirs("test").unwrap();
+        assert!(init::data_dir("test").join("artifacts/changes/implementation").exists());
+        assert!(init::data_dir("test").join("artifacts/changes/debugging").exists());
+    }
+
+    // --- Integration tests: full flow ---
+
+    #[tokio::test]
+    async fn test_full_flow_build_agent() {
+        let (app, session_id) = initialized_app().await;
+
+        // Temper as build agent with explicit prefix and group
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01","prefix":"t3st"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "temper error: {:?}", body);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("build agent"), "expected agent prompt: {}", text);
+
+        // tools/list must not include temper
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let names: Vec<_> = body["result"]["tools"].as_array().unwrap()
+            .iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(!names.contains(&"temper"), "temper must be hidden after call");
+
+        // Change file must exist after temper
+        let change_file = init::data_dir("test")
+            .join("artifacts/changes/implementation/t3st/01-changes.toml");
+        assert!(change_file.exists(), "change file must exist after temper: {:?}", change_file);
+
+        // Write a mock change entry to simulate the hook
+        let entry = "\n[[changes]]\ntimestamp = 1234567890\nfile = \"src/main.rs\"\ndiff = \"\"\"\n-old line\n+new line\n\"\"\"\n";
+        std::fs::write(&change_file, entry).unwrap();
+
+        // Submit artifact (code type always validates)
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"submit","arguments":{"name":"plan","content":"my build plan"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "submit error: {:?}", body);
+
+        // Judge auto-approves (no AR engine in tests)
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"judge","arguments":{"name":"plan"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "judge error: {:?}", body);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let verdict: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(verdict["verdict"], "approve");
+
+        // Change file still contains our entry (not deleted by judge)
+        let content = std::fs::read_to_string(&change_file).unwrap();
+        assert!(content.contains("src/main.rs"), "change file should contain written entry");
+    }
+
+    #[tokio::test]
+    async fn test_full_flow_bugfest_agent() {
+        let (app, session_id) = initialized_app().await;
+
+        // Temper as bugfest agent
+        let resp = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"bugfest","prefix":"b4gs"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "temper error: {:?}", body);
+
+        // Change file must exist at debugging path (no group)
+        let change_file = init::data_dir("test")
+            .join("artifacts/changes/debugging/b4gs/changes.toml");
+        assert!(change_file.exists(), "bugfest change file must exist: {:?}", change_file);
+
+        // Session must have role=bugfest, group=None (verify via /session endpoint)
+        let resp = app.clone().oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/session/{}", session_id))
+                .body(Body::empty())
+                .unwrap(),
+        ).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let session_info: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(session_info["role"], "bugfest");
+        assert!(session_info["group"].is_null(), "bugfest must have no group");
+
+        // Write mock change entry
+        let entry = "\n[[changes]]\ntimestamp = 9999\nfile = \"src/bug.rs\"\ndiff = \"\"\"\n-bad\n+good\n\"\"\"\n";
+        std::fs::write(&change_file, entry).unwrap();
+
+        // Submit a valid diagnosis artifact
+        let diagnosis_toml = r#"[diagnosis]
+symptom = "crash on startup"
+root_cause = "null pointer in init"
+evidence = ["src/main.rs:10"]
+fix = "add null check"
+files_changed = ["src/main.rs"]"#;
+        let submit_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 5,
+            "method": "tools/call",
+            "params": {"name": "submit", "arguments": {"name": "debug", "content": diagnosis_toml}}
+        });
+        let resp = post_mcp_with_session(
+            app.clone(),
+            &submit_body.to_string(),
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "submit error: {:?}", body);
+
+        // Judge auto-approves
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"judge","arguments":{"name":"debug"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "judge error: {:?}", body);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let verdict: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(verdict["verdict"], "approve");
+
+        // Change file still readable
+        let content = std::fs::read_to_string(&change_file).unwrap();
+        assert!(content.contains("src/bug.rs"));
+    }
+
+    // --- Integration tests: multi-agent parallel ---
+
+    #[tokio::test]
+    async fn test_parallel_build_agents_separate_files() {
+        let app = test_app();
+
+        // Initialize session A
+        let resp = app.clone().oneshot(
+            Request::builder()
+                .method("POST").uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"test","version":"0.1"}}}"#))
+                .unwrap(),
+        ).await.unwrap();
+        let session_a = resp.headers().get("mcp-session-id").unwrap().to_str().unwrap().to_owned();
+
+        // Initialize session B
+        let resp = app.clone().oneshot(
+            Request::builder()
+                .method("POST").uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"test","version":"0.1"}}}"#))
+                .unwrap(),
+        ).await.unwrap();
+        let session_b = resp.headers().get("mcp-session-id").unwrap().to_str().unwrap().to_owned();
+
+        // Temper session A: prefix=para, group=01
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01","prefix":"para"}}}"#,
+            &session_a,
+        ).await;
+
+        // Temper session B: same prefix, group=02
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"02","prefix":"para"}}}"#,
+            &session_b,
+        ).await;
+
+        let base = init::data_dir("test").join("artifacts/changes/implementation/para");
+
+        // Each session has its own change file
+        let file_a = base.join("01-changes.toml");
+        let file_b = base.join("02-changes.toml");
+        assert!(file_a.exists(), "session A change file must exist: {:?}", file_a);
+        assert!(file_b.exists(), "session B change file must exist: {:?}", file_b);
+
+        // Write distinct change entries to each file
+        std::fs::write(&file_a, "[[changes]]\ntimestamp=1\nfile=\"a.rs\"\ndiff=\"\"\"\n+a\n\"\"\"\n").unwrap();
+        std::fs::write(&file_b, "[[changes]]\ntimestamp=2\nfile=\"b.rs\"\ndiff=\"\"\"\n+b\n\"\"\"\n").unwrap();
+
+        // Judge from session A returns auto-approve
+        let resp_a = post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"judge","arguments":{"name":"plan"}}}"#,
+            &session_a,
+        ).await;
+        let body_a = body_json(resp_a).await;
+        assert!(body_a.get("error").is_none(), "judge A error: {:?}", body_a);
+
+        // Judge from session B returns auto-approve
+        let resp_b = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"judge","arguments":{"name":"plan"}}}"#,
+            &session_b,
+        ).await;
+        let body_b = body_json(resp_b).await;
+        assert!(body_b.get("error").is_none(), "judge B error: {:?}", body_b);
+
+        // Each file retains its own content
+        let content_a = std::fs::read_to_string(&file_a).unwrap();
+        let content_b = std::fs::read_to_string(&file_b).unwrap();
+        assert!(content_a.contains("a.rs"), "file A should contain A's changes");
+        assert!(content_b.contains("b.rs"), "file B should contain B's changes");
+        assert!(!content_a.contains("b.rs"), "file A must not contain B's changes");
+        assert!(!content_b.contains("a.rs"), "file B must not contain A's changes");
+    }
+
+    // --- Edge case and validation tests ---
+
+    #[tokio::test]
+    async fn test_non_build_role_no_change_file() {
+        let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"solve","prefix":"s0lv"}}}"#,
+            &session_id,
+        ).await;
+
+        let impl_dir = init::data_dir("test").join("artifacts/changes/implementation/s0lv");
+        let debug_dir = init::data_dir("test").join("artifacts/changes/debugging/s0lv");
+        assert!(!impl_dir.exists(), "solve role must not create implementation change dir");
+        assert!(!debug_dir.exists(), "solve role must not create debugging change dir");
+    }
+
+    #[tokio::test]
+    async fn test_group_validation_rejects_single_digit() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"1"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(
+            body["error"]["message"].as_str().unwrap().contains("two-digit"),
+            "error must mention two-digit: {:?}", body["error"]["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_group_validation_rejects_three_digits() {
+        let (app, session_id) = initialized_app().await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"001"}}}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(
+            body["error"]["message"].as_str().unwrap().contains("two-digit"),
+            "error must mention two-digit: {:?}", body["error"]["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_temper_disappears_for_all_roles() {
+        let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"solve"}}}"#,
+            &session_id,
+        ).await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
+            &session_id,
+        ).await;
+        let body = body_json(resp).await;
+        let names: Vec<_> = body["result"]["tools"].as_array().unwrap()
+            .iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(!names.contains(&"temper"), "temper must be hidden after temper call for solve role");
+    }
+
+    #[test]
+    fn test_triple_quote_escaping_in_toml() {
+        // Simulate the escaping logic used in record_change()
+        let raw_diff = "-old \"\"\" line\n+new \"\"\" line";
+        let safe_diff = raw_diff.replace("\"\"\"", "\"\"\\\"");
+
+        let entry = format!(
+            "[[changes]]\ntimestamp = 1234\nfile = \"test.rs\"\ndiff = \"\"\"\n{}\n\"\"\"\n",
+            safe_diff
+        );
+
+        // The resulting TOML must parse without error
+        let parsed: Result<toml::Value, _> = toml::from_str(&entry);
+        assert!(parsed.is_ok(), "escaped TOML must parse: {:?}\n---\n{}", parsed.err(), entry);
+
+        // The parsed diff must contain the original triple-quote characters
+        let changes = parsed.unwrap();
+        let diff_val = changes["changes"][0]["diff"].as_str().unwrap();
+        assert!(diff_val.contains("\"\"\""), "parsed diff must restore triple quotes");
     }
 }

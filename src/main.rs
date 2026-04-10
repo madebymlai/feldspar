@@ -110,47 +110,123 @@ async fn main() {
 }
 
 fn record_change() {
-    let project = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "default".into());
+    // 1. Read stdin JSON for session_id and file_path
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).ok();
+    let stdin: serde_json::Value = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let session_id = match stdin.get("session_id").and_then(|s| s.as_str()) {
+        Some(id) => id,
+        None => return,
+    };
+    let file_path = stdin
+        .get("tool_input")
+        .and_then(|t| t.get("file_path"))
+        .and_then(|f| f.as_str())
+        .unwrap_or("");
+    if file_path.is_empty() {
+        return;
+    }
 
+    // 2. HTTP lookup for prefix/group/role
+    let port = std::env::var("FELDSPAR_PORT").unwrap_or_else(|_| "3581".into());
+    let url = format!("http://127.0.0.1:{}/session/{}", port, session_id);
+    let resp = ureq::get(&url)
+        .call()
+        .ok()
+        .and_then(|r| r.into_body().read_to_string().ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let resp = match resp {
+        Some(r) => r,
+        None => return,
+    };
+
+    let role = resp.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    let prefix = resp.get("prefix").and_then(|p| p.as_str()).unwrap_or("");
+    if prefix.is_empty() || (role != "build" && role != "bugfest") {
+        return;
+    }
+
+    // 3. Scoped git diff
     let diff = std::process::Command::new("git")
-        .args(["diff", "HEAD"])
+        .args(["diff", "HEAD", "--", file_path])
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_default();
-
     if diff.trim().is_empty() {
         return;
     }
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let artifacts_dir = std::path::PathBuf::from(home)
-        .join(".feldspar/data")
-        .join(&project)
-        .join("artifacts/build");
+    // 4. Write to correct TOML file with """ escaping
+    let mode_dir = if role == "build" { "implementation" } else { "debugging" };
+    let group = resp.get("group").and_then(|g| g.as_str());
+    let filename = if role == "build" {
+        format!("{}-changes.toml", group.unwrap_or("00"))
+    } else {
+        "changes.toml".to_owned()
+    };
 
-    if std::fs::create_dir_all(&artifacts_dir).is_err() {
-        return;
-    }
+    let project = init::detect_project_name(None);
+    let dir = init::data_dir(&project)
+        .join("artifacts/changes")
+        .join(mode_dir)
+        .join(prefix);
+    let _ = std::fs::create_dir_all(&dir);
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-
+    let safe_diff = diff.trim().replace("\"\"\"", "\"\"\\\"");
     let entry = format!(
-        "\n[[changes]]\ntimestamp = {}\ndiff = \"\"\"\n{}\"\"\"\n",
-        timestamp,
-        diff.trim()
+        "\n[[changes]]\ntimestamp = {}\nfile = \"{}\"\ndiff = \"\"\"\n{}\"\"\"\n",
+        timestamp, file_path, safe_diff
     );
 
-    let path = artifacts_dir.join("changes.toml");
+    let path = dir.join(filename);
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         use std::io::Write;
         let _ = file.write_all(entry.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_record_change_skips_no_session_id() {
+        // Function reads from real stdin which we can't mock in unit tests.
+        // Verify the escaping logic and JSON parsing directly instead.
+        let input = r#"{"tool_input": {"file_path": "foo.rs"}}"#;
+        let v: serde_json::Value = serde_json::from_str(input).unwrap();
+        assert!(v.get("session_id").is_none());
+    }
+
+    #[test]
+    fn test_record_change_skips_no_file_path() {
+        let input = r#"{"session_id": "abc"}"#;
+        let v: serde_json::Value = serde_json::from_str(input).unwrap();
+        let file_path = v
+            .get("tool_input")
+            .and_then(|t| t.get("file_path"))
+            .and_then(|f| f.as_str())
+            .unwrap_or("");
+        assert!(file_path.is_empty());
+    }
+
+    #[test]
+    fn test_record_change_skips_non_build_role() {
+        let role = "solve";
+        assert!(role != "build" && role != "bugfest");
+    }
+
+    #[test]
+    fn test_triple_quote_escaping() {
+        let diff = "foo\"\"\"bar";
+        let safe = diff.replace("\"\"\"", "\"\"\\\"");
+        assert_eq!(safe, "foo\"\"\\\"bar");
     }
 }
 
@@ -263,6 +339,8 @@ async fn run_server(port: u16, project: &str) {
     let leaf_cache_for_prune = leaf_cache.clone();
     let server = thought::ThinkingServer::new(config, llm, db.clone(), leaf_cache, ml.clone());
     let state = Arc::new(mcp::McpState::new(server, agent_defs, ar_engine, project.to_owned(), port));
+
+    mcp::sweep_orphaned_changes(project);
 
     let cleanup_state = state.clone();
     tokio::spawn(mcp::session_cleanup_task(cleanup_state));

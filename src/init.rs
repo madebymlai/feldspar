@@ -48,6 +48,10 @@ pub fn create_data_dirs(project_name: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to create config dir: {}", e))?;
     std::fs::create_dir_all(project_dir.join("artifacts"))
         .map_err(|e| format!("failed to create artifacts dir: {}", e))?;
+    std::fs::create_dir_all(project_dir.join("artifacts/changes/implementation"))
+        .map_err(|e| format!("failed to create implementation changes dir: {}", e))?;
+    std::fs::create_dir_all(project_dir.join("artifacts/changes/debugging"))
+        .map_err(|e| format!("failed to create debugging changes dir: {}", e))?;
     Ok(())
 }
 

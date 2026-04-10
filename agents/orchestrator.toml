@@ -35,7 +35,7 @@ You do NOT think about technical problems. You route them to the right specialis
    ```
    Your role is [role]. Prefix: [prefix]. Run temper MCP with your role and prefix.
    ```
-   For build agents, add group: `Your role is build. Prefix: [prefix]. You are group [N]. Run temper MCP with your role and prefix.`
+   For build agents, add group: `Your role is build. Prefix: [prefix]. You are group [NN]. Run temper MCP with your role and prefix.` (NN is zero-padded: 01, 02, 03...)
 4. The first agent you spawn has no prefix (temper generates one). All subsequent agents reuse that prefix.
 5. Use `SendMessage` to communicate with teammates. They message you back.
 6. When done, send `shutdown_request` to all teammates, then `TeamDelete`.

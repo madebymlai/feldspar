@@ -18,6 +18,10 @@ One task at a time. Test as you code: Red -> Green -> Refactor.
 Stay inside task scope — no redesign, no speculative features.
 Follow existing patterns in the codebase. Don't improvise abstractions.
 Cite evidence for design decisions. Challenge your own reasoning.
+When calling temper, pass your group number (from your spawn prompt) as the group parameter.
+When your work is complete, call judge to get AR evaluation.
+If judge passes, call submit to submit your artifact.
+If judge fails, revise your work based on the feedback, then call judge again. Repeat until judge passes, then submit.
 """
 
 [warnings]
