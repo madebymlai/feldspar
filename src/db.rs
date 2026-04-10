@@ -12,15 +12,6 @@ pub struct PatternMatch {
     pub trust_reason: Option<String>,
 }
 
-/// Trace data for ML bulk training on startup.
-pub struct TraceRow {
-    pub id: String,
-    pub thinking_mode: Option<String>,
-    pub components: Vec<String>,
-    pub trust_score: Option<f64>,
-    pub created_at: i64,
-}
-
 /// Leaf node entry for in-memory cache.
 pub struct LeafEntry {
     pub trace_id: String,
@@ -182,31 +173,6 @@ impl Db {
         }
     }
 
-    pub async fn load_traces(&self) -> Vec<TraceRow> {
-        self.conn.call(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, thinking_mode, components, trust_score, created_at FROM traces"
-            )?;
-            let rows = stmt.query_map([], |row| {
-                let components_json: Option<String> = row.get(2)?;
-                let components: Vec<String> = components_json
-                    .and_then(|j| serde_json::from_str(&j).ok())
-                    .unwrap_or_default();
-                Ok(TraceRow {
-                    id: row.get(0)?,
-                    thinking_mode: row.get(1)?,
-                    components,
-                    trust_score: row.get(3)?,
-                    created_at: row.get(4)?,
-                })
-            })?.collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        }).await.unwrap_or_else(|e| {
-            warn!("load_traces failed: {}", e);
-            Vec::new()
-        })
-    }
-
     pub async fn load_leaf_nodes(&self) -> Vec<LeafEntry> {
         self.conn.call(|conn| {
             let mut stmt = conn.prepare(
@@ -239,7 +205,7 @@ impl Db {
         let ids = ids.to_vec();
 
         self.conn.call(move |conn| {
-            let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let placeholders = sql_placeholders(ids.len());
             let sql = format!(
                 "SELECT id, thinking_mode, components, trust_score, trust_reason
                  FROM traces WHERE id IN ({})",
@@ -315,30 +281,6 @@ impl Db {
         })
     }
 
-    pub async fn batch_update_leaf_nodes(&self, updates: &[(String, Vec<u8>)]) {
-        if updates.is_empty() {
-            return;
-        }
-        let updates = updates.to_vec();
-
-        if let Err(e) = self.conn.call(move |conn| {
-            conn.execute_batch("BEGIN")?;
-            for (trace_id, blob) in &updates {
-                if let Err(e) = conn.execute(
-                    "UPDATE traces SET leaf_nodes = ?1 WHERE id = ?2",
-                    rusqlite::params![blob, trace_id],
-                ) {
-                    conn.execute_batch("ROLLBACK")?;
-                    return Err(e.into());
-                }
-            }
-            conn.execute_batch("COMMIT")?;
-            Ok(())
-        }).await {
-            warn!("batch_update_leaf_nodes failed: {}", e);
-        }
-    }
-
     pub async fn store_ar_score(
         &self,
         trace_id: &str,
@@ -379,32 +321,30 @@ impl Db {
         let ids = trace_ids.to_vec();
 
         if let Err(e) = self.conn.call(move |conn| {
-            let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let placeholders = sql_placeholders(ids.len());
             let params: Vec<&dyn rusqlite::types::ToSql> = ids
                 .iter()
                 .map(|s| s as &dyn rusqlite::types::ToSql)
                 .collect();
-            conn.execute_batch("BEGIN")?;
-            let r1 = conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
                 &format!("DELETE FROM thoughts WHERE trace_id IN ({})", placeholders),
                 params.as_slice(),
-            );
-            let r2 = conn.execute(
+            )?;
+            tx.execute(
                 &format!("DELETE FROM traces WHERE id IN ({})", placeholders),
                 params.as_slice(),
-            );
-            if r1.is_err() || r2.is_err() {
-                conn.execute_batch("ROLLBACK")?;
-                r1?;
-                r2?;
-            } else {
-                conn.execute_batch("COMMIT")?;
-            }
+            )?;
+            tx.commit()?;
             Ok(())
         }).await {
             warn!("prune failed: {}", e);
         }
     }
+}
+
+fn sql_placeholders(n: usize) -> String {
+    std::iter::repeat("?").take(n).collect::<Vec<_>>().join(",")
 }
 
 #[cfg(test)]
@@ -646,25 +586,6 @@ mod tests {
         assert_eq!(nodes, vec![1, 5, 42, 100]);
     }
 
-    // ─── load_traces ─────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_load_traces_empty() {
-        let (db, _f) = test_db().await;
-        assert!(db.load_traces().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_load_traces_populated() {
-        let (db, _f) = test_db().await;
-        db.flush_trace("a", Some("debugging"), &["redis".into()], None, 1).await;
-        db.flush_trace("b", Some("architecture"), &["auth".into(), "db".into()], None, 2).await;
-        db.flush_trace("c", None, &[], None, 3).await;
-
-        let rows = db.load_traces().await;
-        assert_eq!(rows.len(), 3);
-    }
-
     // ─── load_leaf_nodes ─────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -735,24 +656,6 @@ mod tests {
         let (db, _f) = test_db().await;
         let results = db.find_traces_by_ids(&["nonexistent".into()]).await;
         assert!(results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_components_roundtrip() {
-        let (db, _f) = test_db().await;
-        db.flush_trace("cr", None, &["redis".into(), "auth".into()], None, 1).await;
-        let rows = db.load_traces().await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].components, vec!["redis", "auth"]);
-    }
-
-    #[tokio::test]
-    async fn test_components_empty() {
-        let (db, _f) = test_db().await;
-        db.flush_trace("ce", None, &[], None, 1).await;
-        let rows = db.load_traces().await;
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].components.is_empty());
     }
 
     // ─── load_feature_matrix ─────────────────────────────────────────────────
@@ -842,49 +745,6 @@ mod tests {
         db.update_trust("tc3", 8.0, "ok").await;
 
         assert_eq!(db.trace_count_with_trust().await, 2);
-    }
-
-    // ─── batch_update_leaf_nodes ──────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_batch_update_leaf_nodes_multiple() {
-        let (db, _f) = test_db().await;
-        db.flush_trace("bn1", None, &[], None, 1).await;
-        db.flush_trace("bn2", None, &[], None, 2).await;
-        db.flush_trace("bn3", None, &[], None, 3).await;
-
-        let blob1 = bincode::encode_to_vec(&vec![1usize, 2], bincode::config::standard()).unwrap();
-        let blob2 = bincode::encode_to_vec(&vec![3usize, 4], bincode::config::standard()).unwrap();
-        db.batch_update_leaf_nodes(&[
-            ("bn1".into(), blob1.clone()),
-            ("bn2".into(), blob2.clone()),
-        ]).await;
-
-        let (b1, b2, b3): (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) =
-            db.conn.call(|conn| {
-                let b1 = conn.query_row("SELECT leaf_nodes FROM traces WHERE id='bn1'", [], |r| r.get(0))?;
-                let b2 = conn.query_row("SELECT leaf_nodes FROM traces WHERE id='bn2'", [], |r| r.get(0))?;
-                let b3 = conn.query_row("SELECT leaf_nodes FROM traces WHERE id='bn3'", [], |r| r.get(0))?;
-                Ok((b1, b2, b3))
-            }).await.unwrap();
-
-        assert_eq!(b1, Some(blob1));
-        assert_eq!(b2, Some(blob2));
-        assert!(b3.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_batch_update_leaf_nodes_empty() {
-        let (db, _f) = test_db().await;
-        db.batch_update_leaf_nodes(&[]).await; // must not error
-    }
-
-    #[tokio::test]
-    async fn test_batch_update_leaf_nodes_nonexistent_trace() {
-        let (db, _f) = test_db().await;
-        let blob = bincode::encode_to_vec(&vec![1usize], bincode::config::standard()).unwrap();
-        // UPDATE 0 rows — no error expected
-        db.batch_update_leaf_nodes(&[("ghost".into(), blob)]).await;
     }
 
     // ─── prune ───────────────────────────────────────────────────────────────

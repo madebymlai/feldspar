@@ -258,6 +258,9 @@ pub fn temper(agent: &AgentDef, config: &Config, prefix: &str) -> String {
         for group in &active_principles {
             for p in &group.principles {
                 output.push_str(&format!("- **{}**: {} — {}\n", group.name, p.name, p.rule));
+                for q in &p.ask {
+                    output.push_str(&format!("  - {}\n", q));
+                }
             }
         }
         output.push('\n');
@@ -373,7 +376,6 @@ mod tests {
         Config {
             feldspar: crate::config::FeldsparConfig {
                 db_path: "test.db".into(),
-                model_path: "test.model".into(),
                 recap_every: 3,
                 pattern_recall_top_k: 3,
                 ml_budget: 0.5,
@@ -399,7 +401,7 @@ mod tests {
                 principles: vec![Principle {
                     name: "SRP".into(),
                     rule: "One module, one reason to change.".into(),
-                    ask: vec![],
+                    ask: vec!["Can I describe this module's purpose without using 'and'?".into()],
                 }],
             }],
         }
@@ -410,7 +412,6 @@ mod tests {
         Config {
             feldspar: crate::config::FeldsparConfig {
                 db_path: "test.db".into(),
-                model_path: "test.model".into(),
                 recap_every: 3,
                 pattern_recall_top_k: 3,
                 ml_budget: 0.5,
@@ -475,6 +476,10 @@ mod tests {
         assert!(output.contains("## Active Principles"), "missing Active Principles section");
         assert!(output.contains("SRP"), "missing principle name");
         assert!(output.contains("One module, one reason to change"), "missing principle rule");
+        assert!(
+            output.contains("Can I describe this module's purpose without using 'and'?"),
+            "missing ask question in rendered output"
+        );
     }
 
     #[test]

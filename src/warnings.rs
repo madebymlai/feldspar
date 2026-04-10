@@ -285,17 +285,14 @@ mod tests {
         modes.insert("architecture".into(), ModeConfig {
             requires: vec!["components".into()],
             budget: "deep".into(),
-            watches: String::new(),
         });
         modes.insert("debugging".into(), ModeConfig {
             requires: vec!["evidence".into()],
             budget: "standard".into(),
-            watches: String::new(),
         });
         modes.insert("implementation".into(), ModeConfig {
             requires: vec![],
             budget: "minimal".into(),
-            watches: String::new(),
         });
 
         let mut budgets = HashMap::new();
@@ -306,7 +303,6 @@ mod tests {
         Config {
             feldspar: FeldsparConfig {
                 db_path: String::new(),
-                model_path: String::new(),
                 recap_every: 3,
                 pattern_recall_top_k: 3,
                 ml_budget: 0.5,
@@ -595,7 +591,6 @@ mod tests {
         config.modes.insert("perf".into(), ModeConfig {
             requires: vec!["latency".into()],
             budget: "standard".into(),
-            watches: String::new(),
         });
         let mut input = test_input("performance analysis");
         input.thinking_mode = Some("perf".into());
@@ -610,7 +605,6 @@ mod tests {
         config.modes.insert("review".into(), ModeConfig {
             requires: vec!["confidence".into()],
             budget: "standard".into(),
-            watches: String::new(),
         });
         let mut input = test_input("reviewing code");
         input.thinking_mode = Some("review".into());

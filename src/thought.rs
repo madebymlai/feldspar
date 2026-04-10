@@ -136,14 +136,12 @@ pub enum Severity {
 pub struct ThoughtRecord {
     pub input: ThoughtInput,
     pub result: ThoughtResult,
-    pub created_at: Timestamp,
 }
 
 pub struct Trace {
     pub id: String,
     pub thoughts: Vec<ThoughtRecord>,
     pub created_at: Timestamp,
-    pub closed: bool,
 }
 
 impl Trace {
@@ -151,12 +149,23 @@ impl Trace {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             thoughts: Vec::new(),
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64,
-            closed: false,
+            created_at: now_millis(),
         }
+    }
+}
+
+fn now_millis() -> Timestamp {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+fn mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        f64::NAN
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
     }
 }
 
@@ -223,15 +232,9 @@ impl ThinkingServer {
                 .collect();
 
             // Append record
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
-
             trace.thoughts.push(ThoughtRecord {
                 input: input.clone(),
                 result: ThoughtResult::default(),
-                created_at: now,
             });
 
             // Collect unique branch IDs (BTreeSet for deterministic ordering)
@@ -304,11 +307,7 @@ impl ThinkingServer {
         };
 
         // ADR from removed trace
-        let adr = if let Some(ref trace) = removed_trace {
-            Some(generate_adr(trace))
-        } else {
-            None
-        };
+        let adr = removed_trace.as_ref().map(generate_adr);
 
         // Prune on session start (thought 1)
         if input.thought_number == 1 {
@@ -323,30 +322,9 @@ impl ThinkingServer {
         }
 
         // Trust scoring (blocking — deliberate HC#2 exception: user sees score in completion response)
-        let (trust_score, trust_reason, mut trust_warnings) = if let Some(ref trace) = removed_trace {
-            let mode = trace.thoughts.first()
-                .and_then(|t| t.input.thinking_mode.as_deref());
-
-            match mode {
-                None => {
-                    (None, None, vec!["THINKING_MODE_MISSING".into()])
-                }
-                Some(mode) => {
-                    match self.llm.as_ref() {
-                        Some(llm) if llm.has_api_key() => {
-                            match crate::trace_review::review(llm, trace, mode).await {
-                                Some(score) => (Some(score.trust), Some(score.reason), vec![]),
-                                None => (None, None, vec!["TRUST_SCORE_UNAVAILABLE".into()]),
-                            }
-                        }
-                        _ => {
-                            (None, None, vec!["OPENROUTER_KEY_NOT_SET".into()])
-                        }
-                    }
-                }
-            }
-        } else {
-            (None, None, vec![])
+        let (trust_score, trust_reason, mut trust_warnings) = match removed_trace.as_ref() {
+            Some(trace) => self.score_trust(trace).await,
+            None => (None, None, vec![]),
         };
 
         // Persist trust score to DB (best-effort, background)
@@ -434,32 +412,7 @@ impl ThinkingServer {
         };
 
         // Pattern recall (thought 1 only)
-        let pattern_recall = if input.thought_number == 1 {
-            if let Some(ref ml) = self.ml {
-                let sync_cache: Option<HashMap<String, Vec<usize>>> = {
-                    let cache = self.leaf_cache.read().await;
-                    if cache.len() >= self.config.feldspar.pattern_recall_min_traces as usize {
-                        Some(cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    } else {
-                        None
-                    }
-                };
-                if let Some(sync_cache) = sync_cache {
-                    let ml_snap = build_ml_snapshot_from_phase2(&input, &snapshot, &pipeline);
-                    let features = crate::ml::MlEngine::extract_features(&input, &ml_snap, &ml.mode_map);
-                    let ids = ml.find_similar(
-                        &features,
-                        &sync_cache,
-                        self.config.feldspar.pattern_recall_top_k as usize,
-                    );
-                    if !ids.is_empty() {
-                        if let Some(ref db) = self.db {
-                            Some(db.find_traces_by_ids(&ids).await)
-                        } else { None }
-                    } else { None }
-                } else { None }
-            } else { None }
-        } else { None };
+        let pattern_recall = self.pattern_recall(&input, &snapshot, &pipeline).await;
 
         let mut warnings = generate_warnings(&input, &snapshot.recent_progress, &self.config);
         warnings.extend(pipeline.panic_warnings);
@@ -473,10 +426,7 @@ impl ThinkingServer {
             let thinking_mode = input.thinking_mode.clone();
             let input_json = serde_json::to_string(&input).unwrap_or_default();
             let result_json = "{}".to_owned();
-            let created_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
+            let created_at = now_millis();
             tokio::spawn(async move {
                 db.write_thought(
                     &trace_id,
@@ -500,10 +450,10 @@ impl ThinkingServer {
             alerts: pipeline.alerts,
             confidence_reported: input.confidence,
             confidence_calculated: pipeline.confidence_calculated,
-            confidence_gap: match (input.confidence, pipeline.confidence_calculated) {
-                (Some(reported), Some(calculated)) => Some((reported - calculated).abs()),
-                _ => None,
-            },
+            confidence_gap: input
+                .confidence
+                .zip(pipeline.confidence_calculated)
+                .map(|(r, c)| (r - c).abs()),
             bias_detected: pipeline.observations.bias_detected,
             sycophancy: pipeline.sycophancy_pattern,
             depth_overlap: pipeline.observations.prev_overlap,
@@ -525,6 +475,52 @@ impl ThinkingServer {
         let result = llm.chat_json(RECAP_SYSTEM_PROMPT, thoughts_text, 200).await?;
         result["recap"].as_str().map(|s| s.to_owned())
     }
+
+    async fn score_trust(&self, trace: &Trace) -> (Option<f64>, Option<String>, Vec<String>) {
+        let Some(mode) = trace.thoughts.first().and_then(|t| t.input.thinking_mode.as_deref())
+        else {
+            return (None, None, vec!["THINKING_MODE_MISSING".into()]);
+        };
+        let Some(llm) = self.llm.as_ref().filter(|l| l.has_api_key()) else {
+            return (None, None, vec!["OPENROUTER_KEY_NOT_SET".into()]);
+        };
+        match crate::trace_review::review(llm, trace, mode).await {
+            Some(score) => (Some(score.trust), Some(score.reason), vec![]),
+            None => (None, None, vec!["TRUST_SCORE_UNAVAILABLE".into()]),
+        }
+    }
+
+    async fn pattern_recall(
+        &self,
+        input: &ThoughtInput,
+        snapshot: &TraceSnapshot,
+        pipeline: &crate::analyzers::PipelineResult,
+    ) -> Option<Vec<crate::db::PatternMatch>> {
+        if input.thought_number != 1 {
+            return None;
+        }
+        let ml = self.ml.as_ref()?;
+        let db = self.db.as_ref()?;
+        let min = self.config.feldspar.pattern_recall_min_traces as usize;
+        let sync_cache: HashMap<String, Vec<usize>> = {
+            let cache = self.leaf_cache.read().await;
+            if cache.len() < min {
+                return None;
+            }
+            cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        let ml_snap = build_ml_snapshot_from_phase2(input, snapshot, pipeline);
+        let features = crate::ml::MlEngine::extract_features(input, &ml_snap, &ml.mode_map);
+        let ids = ml.find_similar(
+            &features,
+            &sync_cache,
+            self.config.feldspar.pattern_recall_top_k as usize,
+        );
+        if ids.is_empty() {
+            return None;
+        }
+        Some(db.find_traces_by_ids(&ids).await)
+    }
 }
 
 const RECAP_SYSTEM_PROMPT: &str = "You summarize thinking traces. Given numbered thoughts, \
@@ -541,11 +537,7 @@ fn build_ml_snapshot_from_phase2(
 ) -> crate::ml::TraceSnapshot {
     let branch_inputs = &snapshot.branch_records;
     let confidences: Vec<f64> = branch_inputs.iter().filter_map(|t| t.confidence).collect();
-    let avg_confidence = if confidences.is_empty() {
-        f64::NAN
-    } else {
-        confidences.iter().sum::<f64>() / confidences.len() as f64
-    };
+    let avg_confidence = mean(&confidences);
 
     crate::ml::TraceSnapshot {
         thought_count: snapshot.thought_history_length as u32,
@@ -572,11 +564,7 @@ fn build_trace_snapshot(trace: &Trace) -> crate::ml::TraceSnapshot {
     let n = thoughts.len() as u32;
 
     let confidences: Vec<f64> = thoughts.iter().filter_map(|t| t.input.confidence).collect();
-    let avg_confidence = if confidences.is_empty() {
-        f64::NAN
-    } else {
-        confidences.iter().sum::<f64>() / confidences.len() as f64
-    };
+    let avg_confidence = mean(&confidences);
 
     // These depend on stored ThoughtResult fields (always None — not persisted).
     let gaps: Vec<f64> = thoughts
@@ -587,11 +575,7 @@ fn build_trace_snapshot(trace: &Trace) -> crate::ml::TraceSnapshot {
             Some((reported - calculated).abs())
         })
         .collect();
-    let avg_confidence_gap = if gaps.is_empty() {
-        f64::NAN
-    } else {
-        gaps.iter().sum::<f64>() / gaps.len() as f64
-    };
+    let avg_confidence_gap = mean(&gaps);
     let confidence_convergence = if gaps.len() >= 3 {
         let last3 = &gaps[gaps.len() - 3..];
         let mean = last3.iter().sum::<f64>() / 3.0;
@@ -829,7 +813,6 @@ mod tests {
         let config = crate::config::Config {
             feldspar: crate::config::FeldsparConfig {
                 db_path: "test.db".into(),
-                model_path: "test.model".into(),
                 recap_every: 3,
                 pattern_recall_top_k: 3,
                 ml_budget: 0.5,
@@ -856,7 +839,6 @@ mod tests {
                     crate::config::ModeConfig {
                         requires: vec![],
                         budget: "deep".into(),
-                        watches: "test watches".into(),
                     },
                 ),
                 (
@@ -864,7 +846,6 @@ mod tests {
                     crate::config::ModeConfig {
                         requires: vec![],
                         budget: "standard".into(),
-                        watches: "x".into(),
                     },
                 ),
             ]),
@@ -980,7 +961,6 @@ mod tests {
         let t = Trace::new();
         assert_eq!(t.id.len(), 36);
         assert!(t.thoughts.is_empty());
-        assert!(!t.closed);
         assert!(t.created_at > 0);
     }
 
@@ -1236,7 +1216,6 @@ mod tests {
                     needs_more_thoughts: false,
                 },
                 result: ThoughtResult::default(),
-                created_at: 1712361600000, // 2024-04-06
             });
         }
         trace
@@ -1478,7 +1457,6 @@ mod tests {
         let config = crate::config::Config {
             feldspar: crate::config::FeldsparConfig {
                 db_path: "test.db".into(),
-                model_path: "test.model".into(),
                 recap_every: 3,
                 pattern_recall_top_k: 3,
                 ml_budget: 0.5,
@@ -1505,7 +1483,6 @@ mod tests {
                     crate::config::ModeConfig {
                         requires: vec![],
                         budget: "deep".into(),
-                        watches: String::new(),
                     },
                 ),
             ]),
@@ -1591,7 +1568,6 @@ mod tests {
         let config = crate::config::Config {
             feldspar: crate::config::FeldsparConfig {
                 db_path: "test.db".into(),
-                model_path: "test.model".into(),
                 recap_every: 3,
                 pattern_recall_top_k: 3,
                 ml_budget: 0.5,
@@ -1617,7 +1593,6 @@ mod tests {
                 crate::config::ModeConfig {
                     requires: vec![],
                     budget: "deep".into(),
-                    watches: String::new(),
                 },
             )]),
             components: crate::config::ComponentsConfig { valid: vec![] },

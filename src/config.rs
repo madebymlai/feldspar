@@ -30,7 +30,6 @@ pub struct ArConfig {
 #[derive(Debug, Deserialize)]
 pub struct FeldsparConfig {
     pub db_path: String,
-    pub model_path: String,
     pub recap_every: u32,
     #[serde(default = "default_top_k")]
     pub pattern_recall_top_k: u32,
@@ -62,7 +61,6 @@ pub struct ThresholdsConfig {
 pub struct ModeConfig {
     pub requires: Vec<String>,
     pub budget: String,
-    pub watches: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,7 +259,6 @@ mod tests {
         Config {
             feldspar: FeldsparConfig {
                 db_path: "test.db".into(),
-                model_path: "test.model".into(),
                 recap_every: 3,
                 pattern_recall_top_k: 3,
                 ml_budget: 0.5,
@@ -288,7 +285,6 @@ mod tests {
                     ModeConfig {
                         requires: vec![],
                         budget: "standard".into(),
-                        watches: "test watches".into(),
                     },
                 ),
                 (
@@ -296,7 +292,6 @@ mod tests {
                     ModeConfig {
                         requires: vec!["components".into()],
                         budget: "deep".into(),
-                        watches: String::new(),
                     },
                 ),
                 (
@@ -304,7 +299,6 @@ mod tests {
                     ModeConfig {
                         requires: vec![],
                         budget: "minimal".into(),
-                        watches: String::new(),
                     },
                 ),
             ]),
@@ -366,12 +360,10 @@ mod tests {
             ModeConfig {
                 requires: vec![],
                 budget: "standard".into(),
-                watches: "overridden".into(),
             },
         );
         merge_config(&mut base, overlay);
         assert_eq!(base.modes["architecture"].budget, "standard");
-        assert_eq!(base.modes["architecture"].watches, "overridden");
     }
 
     #[test]
@@ -442,7 +434,6 @@ mod tests {
             ModeConfig {
                 requires: vec![],
                 budget: "nonexistent".into(),
-                watches: "x".into(),
             },
         );
         validate(&config, &[]);
@@ -475,7 +466,6 @@ mod tests {
             r#"
 [feldspar]
 db_path = "test.db"
-model_path = "test.model"
 recap_every = 3
 
 {llm_section}
@@ -548,7 +538,6 @@ valid = []
             ModeConfig {
                 requires: vec!["nonexistent".into()],
                 budget: "standard".into(),
-                watches: "x".into(),
             },
         );
         validate(&config, &[]);
@@ -583,7 +572,6 @@ valid = []
         let toml = r#"
 [feldspar]
 db_path = "test.db"
-model_path = "test.model"
 recap_every = 3
 
 [llm]
@@ -611,7 +599,6 @@ valid = []
         let toml = r#"
 [feldspar]
 db_path = "test.db"
-model_path = "test.model"
 recap_every = 3
 pattern_recall_top_k = 5
 
@@ -639,7 +626,6 @@ valid = []
         r#"
 [feldspar]
 db_path = "test.db"
-model_path = "test.model"
 recap_every = 3
 
 [llm]

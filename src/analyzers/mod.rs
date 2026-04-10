@@ -329,7 +329,6 @@ pub(crate) mod tests {
         Config {
             feldspar: FeldsparConfig {
                 db_path: "test.db".into(),
-                model_path: "test.model".into(),
                 recap_every: 3,
                 pattern_recall_top_k: 3,
                 ml_budget: 0.5,
@@ -356,7 +355,6 @@ pub(crate) mod tests {
                     ModeConfig {
                         requires: vec![],
                         budget: "deep".into(),
-                        watches: String::new(),
                     },
                 ),
                 (
@@ -364,7 +362,6 @@ pub(crate) mod tests {
                     ModeConfig {
                         requires: vec![],
                         budget: "minimal".into(),
-                        watches: String::new(),
                     },
                 ),
             ]),

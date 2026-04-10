@@ -91,7 +91,6 @@ mod tests {
                 needs_more_thoughts: false,
             },
             result: ThoughtResult::default(),
-            created_at: 0,
         }
     }
 

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct BriefArtifact {
@@ -66,88 +65,6 @@ pub struct Claim {
     pub text: String,
     pub status: String,
     pub location: String,
-}
-
-impl Requirement {
-    pub fn json_schema() -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "Requirement identifier" },
-                "description": { "type": "string", "description": "What is required" },
-                "user_story": { "type": "string", "description": "As a [user], I want [goal] so that [reason]" }
-            },
-            "required": ["name", "description", "user_story"],
-            "additionalProperties": false
-        })
-    }
-}
-
-impl Module {
-    pub fn json_schema() -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "Module name" },
-                "purpose": { "type": "string", "description": "What this module is responsible for" },
-                "leverages": { "type": "array", "items": { "type": "string" }, "description": "Technologies/patterns used" },
-                "description": { "type": "string", "description": "Detailed module description" }
-            },
-            "required": ["name", "purpose", "leverages", "description"],
-            "additionalProperties": false
-        })
-    }
-}
-
-impl Task {
-    pub fn json_schema() -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "number": { "type": "integer", "description": "Task number" },
-                "name": { "type": "string", "description": "Task name" },
-                "group": { "type": "string", "pattern": "^[0-9]{2}$", "description": "Group identifier (NN format, e.g. 01, 02)" },
-                "depends_on": { "type": "array", "items": { "type": "integer" }, "description": "Task numbers this depends on" },
-                "leverages": { "type": "array", "items": { "type": "string" }, "description": "Technologies/patterns used" },
-                "description": { "type": "string", "description": "What this task accomplishes" }
-            },
-            "required": ["number", "name", "group", "depends_on", "leverages", "description"],
-            "additionalProperties": false
-        })
-    }
-}
-
-impl Diagnosis {
-    pub fn json_schema() -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "symptom": { "type": "string", "description": "Observable problem" },
-                "root_cause": { "type": "string", "description": "Underlying cause" },
-                "evidence": { "type": "array", "items": { "type": "string" }, "description": "Supporting evidence (file paths, logs)" },
-                "fix": { "type": "string", "description": "How to fix the problem" },
-                "files_changed": { "type": "array", "items": { "type": "string" }, "description": "Files that need to change" }
-            },
-            "required": ["symptom", "root_cause", "evidence", "fix", "files_changed"],
-            "additionalProperties": false
-        })
-    }
-}
-
-impl Claim {
-    pub fn json_schema() -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "number": { "type": "integer", "description": "Claim number" },
-                "text": { "type": "string", "description": "Claim text" },
-                "status": { "type": "string", "enum": ["matched", "gap", "partial", "ambiguous"], "description": "Validation status" },
-                "location": { "type": "string", "description": "Where in the codebase this claim applies" }
-            },
-            "required": ["number", "text", "status", "location"],
-            "additionalProperties": false
-        })
-    }
 }
 
 pub fn validate(artifact_type: &str, content: &str) -> Result<(), String> {

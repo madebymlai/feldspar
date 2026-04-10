@@ -73,7 +73,7 @@ pub fn run_init(project_name: &str, project_dir: &Path, api_key: &str) -> Result
     write_default_configs(project_name)?;
 
     // Write consumer project files
-    write_mcp_json(project_dir, project_name, api_key)?;
+    write_mcp_json(project_dir, api_key)?;
     write_hooks_settings(project_dir)?;
     write_skill_files(project_dir)?;
 
@@ -122,7 +122,7 @@ fn write_default_configs(project_name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn write_mcp_json(project_dir: &Path, project_name: &str, api_key: &str) -> Result<(), String> {
+fn write_mcp_json(project_dir: &Path, api_key: &str) -> Result<(), String> {
     use serde_json::{json, Value};
 
     let mcp_path = project_dir.join(".mcp.json");
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn test_write_mcp_json_new() {
         let tmp = TempDir::new().unwrap();
-        write_mcp_json(tmp.path(), "my-proj", "test-key").unwrap();
+        write_mcp_json(tmp.path(), "test-key").unwrap();
         let content = std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(v["mcpServers"]["feldspar"].is_object());
@@ -558,7 +558,7 @@ mod tests {
         )
         .unwrap();
 
-        write_mcp_json(tmp.path(), "my-proj", "test-key").unwrap();
+        write_mcp_json(tmp.path(), "test-key").unwrap();
 
         let content = std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();

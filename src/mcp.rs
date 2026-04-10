@@ -30,9 +30,6 @@ pub struct McpState {
 }
 
 pub struct Session {
-    pub id: String,
-    pub initialized: bool,
-    pub created_at: Timestamp,
     pub last_activity: Timestamp,
     pub prefix: Option<String>,
     pub thinking_mode: Option<String>,
@@ -465,14 +462,10 @@ async fn handle_initialize(
     }
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let now = now_millis();
     state.sessions.write().await.insert(
         session_id.clone(),
         Session {
-            id: session_id.clone(),
-            initialized: true,
-            created_at: now,
-            last_activity: now,
+            last_activity: now_millis(),
             prefix: None,
             thinking_mode: None,
             artifact_type: None,
@@ -619,47 +612,6 @@ fn remove_tool_def() -> Value {
     })
 }
 
-fn unit_schema_for(artifact_type: &str) -> (&str, Value) {
-    match artifact_type {
-        "brief" => ("requirement", crate::schemas::Requirement::json_schema()),
-        "design" => ("module", crate::schemas::Module::json_schema()),
-        "execution_plan" => ("task", crate::schemas::Task::json_schema()),
-        "diagnosis" => ("diagnosis", crate::schemas::Diagnosis::json_schema()),
-        "validation_report" => ("claim", crate::schemas::Claim::json_schema()),
-        _ => unreachable!("unhandled artifact_type: {artifact_type}"),
-    }
-}
-
-fn unit_key_for(artifact_type: &str) -> (&str, Value) {
-    match artifact_type {
-        "diagnosis" => ("diagnosis", json!({
-            "type": "object", "properties": {}, "required": [],
-            "additionalProperties": false
-        })),
-        "validation_report" => ("claim", json!({
-            "type": "object",
-            "properties": { "number": { "type": "integer", "description": "Claim number to remove" } },
-            "required": ["number"], "additionalProperties": false
-        })),
-        "brief" => ("requirement", json!({
-            "type": "object",
-            "properties": { "name": { "type": "string", "description": "Requirement name to remove" } },
-            "required": ["name"], "additionalProperties": false
-        })),
-        "design" => ("module", json!({
-            "type": "object",
-            "properties": { "name": { "type": "string", "description": "Module name to remove" } },
-            "required": ["name"], "additionalProperties": false
-        })),
-        "execution_plan" => ("task", json!({
-            "type": "object",
-            "properties": { "name": { "type": "string", "description": "Task name to remove" } },
-            "required": ["name"], "additionalProperties": false
-        })),
-        _ => unreachable!("unhandled artifact_type: {artifact_type}"),
-    }
-}
-
 fn deserialize_unit(artifact_type: &str, arguments: &serde_json::Value) -> Result<toml::Value, String> {
     match artifact_type {
         "brief" => {
@@ -788,6 +740,35 @@ fn find_unit_index(arr: &[toml::Value], key_field: &str, key_value: &toml::Value
             .map(|v| v == key_value)
             .unwrap_or(false)
     })
+}
+
+fn display_key(key: &toml::Value) -> String {
+    match key {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Integer(n) => n.to_string(),
+        _ => "?".into(),
+    }
+}
+
+/// Load (prefix, thinking_mode, artifact_type) from the current session, or
+/// return a JSON-RPC error describing the missing piece. Used by
+/// submit/revise/remove to avoid duplicating the session lookup preamble.
+async fn session_artifact_ctx(
+    state: &McpState,
+    headers: &HeaderMap,
+    id: &Value,
+) -> Result<(String, String, String), Value> {
+    let session_id = validate_session(state, headers).await
+        .map_err(|_| jsonrpc_error(Some(id.clone()), -32602, "No valid session"))?;
+    let sessions = state.sessions.read().await;
+    let session = sessions.get(&session_id)
+        .ok_or_else(|| jsonrpc_error(Some(id.clone()), -32602, "Session not found"))?;
+    let prefix = session.prefix.clone()
+        .ok_or_else(|| jsonrpc_error(Some(id.clone()), -32602, "Must call temper first"))?;
+    let artifact_type = session.artifact_type.clone()
+        .ok_or_else(|| jsonrpc_error(Some(id.clone()), -32602, "No artifact type set"))?;
+    let mode = session.thinking_mode.clone().unwrap_or_else(|| "unknown".into());
+    Ok((prefix, mode, artifact_type))
 }
 
 fn fetch_tool_def() -> Value {
@@ -1282,27 +1263,9 @@ async fn handle_tools_call(state: &McpState, headers: &HeaderMap, id: Value, par
 }
 
 async fn handle_submit(state: &McpState, headers: &HeaderMap, id: Value, params: Option<Value>) -> Value {
-    let session_id = match validate_session(state, headers).await {
-        Ok(id) => id,
-        Err(_) => return jsonrpc_error(Some(id), -32602, "No valid session"),
-    };
-
-    let (prefix, mode, artifact_type) = {
-        let sessions = state.sessions.read().await;
-        let session = match sessions.get(&session_id) {
-            Some(s) => s,
-            None => return jsonrpc_error(Some(id), -32602, "Session not found"),
-        };
-        let prefix = match &session.prefix {
-            Some(p) => p.clone(),
-            None => return jsonrpc_error(Some(id), -32602, "Must call temper first"),
-        };
-        let mode = session.thinking_mode.clone().unwrap_or_else(|| "unknown".into());
-        let artifact_type = match &session.artifact_type {
-            Some(at) => at.clone(),
-            None => return jsonrpc_error(Some(id), -32602, "No artifact type set"),
-        };
-        (prefix, mode, artifact_type)
+    let (prefix, mode, artifact_type) = match session_artifact_ctx(state, headers, &id).await {
+        Ok(ctx) => ctx,
+        Err(err) => return err,
     };
 
     let arguments = params.as_ref()
@@ -1385,27 +1348,9 @@ async fn handle_submit(state: &McpState, headers: &HeaderMap, id: Value, params:
 }
 
 async fn handle_revise(state: &McpState, headers: &HeaderMap, id: Value, params: Option<Value>) -> Value {
-    let session_id = match validate_session(state, headers).await {
-        Ok(id) => id,
-        Err(_) => return jsonrpc_error(Some(id), -32602, "No valid session"),
-    };
-
-    let (prefix, mode, artifact_type) = {
-        let sessions = state.sessions.read().await;
-        let session = match sessions.get(&session_id) {
-            Some(s) => s,
-            None => return jsonrpc_error(Some(id), -32602, "Session not found"),
-        };
-        let prefix = match &session.prefix {
-            Some(p) => p.clone(),
-            None => return jsonrpc_error(Some(id), -32602, "Must call temper first"),
-        };
-        let mode = session.thinking_mode.clone().unwrap_or_else(|| "unknown".into());
-        let artifact_type = match &session.artifact_type {
-            Some(at) => at.clone(),
-            None => return jsonrpc_error(Some(id), -32602, "No artifact type set"),
-        };
-        (prefix, mode, artifact_type)
+    let (prefix, mode, artifact_type) = match session_artifact_ctx(state, headers, &id).await {
+        Ok(ctx) => ctx,
+        Err(err) => return err,
     };
 
     let arguments = params.as_ref()
@@ -1468,14 +1413,14 @@ async fn handle_revise(state: &McpState, headers: &HeaderMap, id: Value, params:
             Some(a) => a,
             None => return jsonrpc_error(Some(id), -32602,
                 &format!("{} '{}' not found. Use submit to create.", toml_key,
-                    match &key_value { toml::Value::String(s) => s.clone(), toml::Value::Integer(n) => n.to_string(), _ => "?".into() })),
+                    display_key(&key_value))),
         };
 
         let idx = match find_unit_index(arr, key_field.unwrap(), &key_value) {
             Some(i) => i,
             None => return jsonrpc_error(Some(id), -32602,
                 &format!("{} '{}' not found. Use submit to create.", toml_key,
-                    match &key_value { toml::Value::String(s) => s.clone(), toml::Value::Integer(n) => n.to_string(), _ => "?".into() })),
+                    display_key(&key_value))),
         };
 
         arr[idx] = unit_value;
@@ -1499,27 +1444,9 @@ async fn handle_revise(state: &McpState, headers: &HeaderMap, id: Value, params:
 }
 
 async fn handle_remove(state: &McpState, headers: &HeaderMap, id: Value, params: Option<Value>) -> Value {
-    let session_id = match validate_session(state, headers).await {
-        Ok(id) => id,
-        Err(_) => return jsonrpc_error(Some(id), -32602, "No valid session"),
-    };
-
-    let (prefix, mode, artifact_type) = {
-        let sessions = state.sessions.read().await;
-        let session = match sessions.get(&session_id) {
-            Some(s) => s,
-            None => return jsonrpc_error(Some(id), -32602, "Session not found"),
-        };
-        let prefix = match &session.prefix {
-            Some(p) => p.clone(),
-            None => return jsonrpc_error(Some(id), -32602, "Must call temper first"),
-        };
-        let mode = session.thinking_mode.clone().unwrap_or_else(|| "unknown".into());
-        let artifact_type = match &session.artifact_type {
-            Some(at) => at.clone(),
-            None => return jsonrpc_error(Some(id), -32602, "No artifact type set"),
-        };
-        (prefix, mode, artifact_type)
+    let (prefix, mode, artifact_type) = match session_artifact_ctx(state, headers, &id).await {
+        Ok(ctx) => ctx,
+        Err(err) => return err,
     };
 
     let arguments = params.as_ref()
@@ -1561,14 +1488,14 @@ async fn handle_remove(state: &McpState, headers: &HeaderMap, id: Value, params:
             Some(a) => a,
             None => return jsonrpc_error(Some(id), -32602,
                 &format!("{} '{}' not found.", toml_key,
-                    match &key_value { toml::Value::String(s) => s.clone(), toml::Value::Integer(n) => n.to_string(), _ => "?".into() })),
+                    display_key(&key_value))),
         };
 
         let idx = match find_unit_index(arr, key_field.unwrap(), &key_value) {
             Some(i) => i,
             None => return jsonrpc_error(Some(id), -32602,
                 &format!("{} '{}' not found.", toml_key,
-                    match &key_value { toml::Value::String(s) => s.clone(), toml::Value::Integer(n) => n.to_string(), _ => "?".into() })),
+                    display_key(&key_value))),
         };
 
         arr.remove(idx);
@@ -1738,7 +1665,6 @@ mod tests {
         Arc::new(crate::config::Config {
             feldspar: crate::config::FeldsparConfig {
                 db_path: "test.db".into(),
-                model_path: "test.model".into(),
                 recap_every: 3,
                 pattern_recall_top_k: 3,
                 ml_budget: 0.5,
@@ -1764,7 +1690,6 @@ mod tests {
                 crate::config::ModeConfig {
                     requires: vec![],
                     budget: "deep".into(),
-                    watches: "test".into(),
                 },
             )]),
             components: crate::config::ComponentsConfig { valid: vec![] },
@@ -3106,9 +3031,6 @@ mod tests {
         {
             let mut sessions = state.sessions.write().await;
             let expired = Session {
-                id: "exp1".into(),
-                initialized: true,
-                created_at: 0,
                 last_activity: 0, // already expired
                 prefix: Some("cl01".into()),
                 thinking_mode: None,
@@ -3161,13 +3083,12 @@ mod tests {
             let mut sessions = state.sessions.write().await;
             // Expired session with prefix sh01
             sessions.insert("exp".into(), Session {
-                id: "exp".into(), initialized: true, created_at: 0, last_activity: 0,
+                last_activity: 0,
                 prefix: Some("sh01".into()), thinking_mode: None, artifact_type: None,
                 ar_gated: false, judge_cycle: 0, role: Some("build".into()), group: Some("01".into()),
             });
             // Active session with same prefix
             sessions.insert("active".into(), Session {
-                id: "active".into(), initialized: true, created_at: now_millis(),
                 last_activity: now_millis(),
                 prefix: Some("sh01".into()), thinking_mode: None, artifact_type: None,
                 ar_gated: false, judge_cycle: 0, role: Some("build".into()), group: Some("02".into()),
