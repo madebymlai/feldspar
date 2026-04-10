@@ -45,6 +45,9 @@ rand = "0.8"
 # Sync HTTP client (for hook → server lookup)
 ureq = "3"
 
+[target.'cfg(windows)'.dependencies]
+ctrlc = "3"
+
 [dev-dependencies]
 assert_matches = "1.5"
 tower = { version = "0.5", features = ["util"] }

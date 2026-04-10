@@ -4,10 +4,12 @@ mod ar;
 mod schemas;
 mod config;
 mod db;
+mod doctor;
 mod init;
 mod llm;
 mod mcp;
 mod ml;
+mod proxy;
 mod thought;
 mod trace_review;
 mod warnings;
@@ -50,6 +52,8 @@ enum Commands {
         #[command(subcommand)]
         action: HookAction,
     },
+    /// Diagnose and auto-fix feldspar shim, PATH, and multiplexer issues
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -60,8 +64,27 @@ enum HookAction {
     SessionStart,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Proxy check FIRST — before tokio, tracing, or clap
+    let invoked_as = std::env::args()
+        .next()
+        .and_then(|a| {
+            std::path::Path::new(&a)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+
+    if invoked_as == "claude" || invoked_as == "claude.exe" {
+        proxy::run(std::env::args().skip(1).collect());
+    }
+
+    // Normal feldspar path — NOW start tokio
+    let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     tracing_subscriber::fmt()
         .with_target(false)
         .json()
@@ -106,6 +129,9 @@ async fn main() {
             HookAction::RecordChange => record_change(),
             HookAction::SessionStart => session_start(),
         },
+        Commands::Doctor => {
+            doctor::run().await;
+        }
     }
 }
 
