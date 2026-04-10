@@ -546,7 +546,6 @@ fn sequentialthinking_tool_def() -> Value {
                     "- thoughtNumber: Current step (1-indexed).\n",
                     "- totalThoughts: Estimated total (adjust up or down as you progress).\n",
                     "- nextThoughtNeeded: True if more thinking needed. False to complete the trace.\n",
-                    "- thinkingMode: Domain mode (e.g. architecture, debugging, implementation). Triggers mode-specific validation.\n",
                     "- affectedComponents: System components involved in this decision.\n",
                     "- confidence: Your confidence in current reasoning (0-100). Independently calibrated.\n",
                     "- evidence: Citations -- file paths, docs, measurements, links. Earns confidence points.\n",
@@ -566,7 +565,6 @@ fn sequentialthinking_tool_def() -> Value {
                 "thoughtNumber": { "type": "integer", "description": "Current step (1-indexed)." },
                 "totalThoughts": { "type": "integer", "description": "Estimated total." },
                 "nextThoughtNeeded": { "type": "boolean", "description": "True if more thinking needed." },
-                "thinkingMode": { "type": "string", "description": "Domain mode (architecture, debugging, etc)." },
                 "affectedComponents": { "type": "array", "items": { "type": "string" } },
                 "confidence": { "type": "number", "description": "Self-reported confidence 0-100." },
                 "evidence": { "type": "array", "items": { "type": "string" } },
@@ -1011,11 +1009,14 @@ fn configure_remove_mode(id: Value, arguments: &Value, config_dir: &std::path::P
 }
 
 fn handle_tools_list(has_prefix: bool, has_role: bool, is_ar_gated: bool, id: Value) -> Value {
-    let mut tools = vec![sequentialthinking_tool_def()];
+    let mut tools = vec![];
     if !has_role {
         tools.push(temper_tool_def());
     }
     tools.push(configure_tool_def());
+    if has_role {
+        tools.push(sequentialthinking_tool_def());
+    }
     if has_prefix {
         tools.push(submit_tool_def());
         tools.push(fetch_tool_def());
@@ -1126,10 +1127,18 @@ async fn handle_tools_call(state: &McpState, headers: &HeaderMap, id: Value, par
                 None => return jsonrpc_error(Some(id), -32602, "Missing arguments"),
             };
 
-            let input: ThoughtInput = match serde_json::from_value(arguments.clone()) {
+            let mut input: ThoughtInput = match serde_json::from_value(arguments.clone()) {
                 Ok(i) => i,
                 Err(e) => return jsonrpc_error(Some(id), -32602, &format!("Invalid arguments: {}", e)),
             };
+
+            // Inject thinking_mode from session (set by temper)
+            if let Ok(sid) = validate_session(state, headers).await {
+                let sessions = state.sessions.read().await;
+                if let Some(session) = sessions.get(&sid) {
+                    input.thinking_mode = session.thinking_mode.clone();
+                }
+            }
 
             match state.server.process_thought(input).await {
                 Ok(wire) => {
@@ -1404,6 +1413,12 @@ mod tests {
         })
     }
 
+    #[test]
+    fn test_sequentialthinking_schema_no_thinking_mode() {
+        let tool = sequentialthinking_tool_def();
+        assert!(tool["inputSchema"]["properties"]["thinkingMode"].is_null());
+    }
+
     fn test_app() -> Router<()> {
         use std::collections::HashMap;
         use tokio::sync::RwLock;
@@ -1668,11 +1683,11 @@ mod tests {
 
     #[test]
     fn test_tools_list_no_prefix() {
-        // No prefix → temper + configure, no submit/fetch/judge
+        // No prefix, no role → temper + configure, no sequentialthinking/submit/fetch/judge
         let result = handle_tools_list(false, false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"sequentialthinking"));
+        assert!(!names.contains(&"sequentialthinking"));
         assert!(names.contains(&"temper"));
         assert!(names.contains(&"configure"));
         assert!(!names.contains(&"submit"));
@@ -1682,11 +1697,11 @@ mod tests {
 
     #[test]
     fn test_tools_list_with_prefix_ar_gated() {
-        // has_prefix=true, ar_gated=true → submit + fetch + judge
+        // has_prefix=true, ar_gated=true, no role → temper + configure + submit + fetch + judge (no sequentialthinking)
         let result = handle_tools_list(true, false, true, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"sequentialthinking"));
+        assert!(!names.contains(&"sequentialthinking"));
         assert!(names.contains(&"temper"));
         assert!(names.contains(&"configure"));
         assert!(names.contains(&"submit"));
@@ -1752,9 +1767,15 @@ mod tests {
     #[tokio::test]
     async fn test_tools_list_has_sequentialthinking() {
         let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            &session_id,
+        )
+        .await;
         let resp = post_mcp_with_session(
             app,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
             &session_id,
         )
         .await;
@@ -1768,6 +1789,12 @@ mod tests {
     #[tokio::test]
     async fn test_tools_call_valid_thought() {
         let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            &session_id,
+        )
+        .await;
         let resp = post_mcp_with_session(
             app,
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sequentialthinking","arguments":{"thought":"test","thoughtNumber":1,"totalThoughts":3,"nextThoughtNeeded":true}}}"#,
@@ -1798,6 +1825,12 @@ mod tests {
     #[tokio::test]
     async fn test_tools_call_invalid_args() {
         let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            &session_id,
+        )
+        .await;
         let resp = post_mcp_with_session(
             app,
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sequentialthinking","arguments":{"bad":"data"}}}"#,
@@ -1811,6 +1844,12 @@ mod tests {
     #[tokio::test]
     async fn test_tools_call_extracts_params_arguments() {
         let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            &session_id,
+        )
+        .await;
         // arguments are inside params.arguments, not top-level
         let resp = post_mcp_with_session(
             app,
@@ -1916,10 +1955,18 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-        // 3. tools/call thought 1 (no traceId)
+        // 3. temper to establish role
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            &session_id,
+        )
+        .await;
+
+        // 4. tools/call thought 1 (no traceId)
         let resp = post_mcp_with_session(
             app.clone(),
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sequentialthinking","arguments":{"thought":"first thought","thoughtNumber":1,"totalThoughts":2,"nextThoughtNeeded":true}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sequentialthinking","arguments":{"thought":"first thought","thoughtNumber":1,"totalThoughts":2,"nextThoughtNeeded":true}}}"#,
             &session_id,
         )
         .await;
@@ -1929,9 +1976,9 @@ mod tests {
         let trace_id = wire["traceId"].as_str().unwrap().to_owned();
         assert_eq!(wire["thoughtNumber"], 1);
 
-        // 4. tools/call thought 2 (with traceId)
+        // 5. tools/call thought 2 (with traceId)
         let call2 = format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"sequentialthinking","arguments":{{"traceId":"{trace_id}","thought":"second thought","thoughtNumber":2,"totalThoughts":2,"nextThoughtNeeded":false}}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"sequentialthinking","arguments":{{"traceId":"{trace_id}","thought":"second thought","thoughtNumber":2,"totalThoughts":2,"nextThoughtNeeded":false}}}}}}"#
         );
         let resp = post_mcp_with_session(app.clone(), &call2, &session_id).await;
         let body = body_json(resp).await;
@@ -1943,9 +1990,15 @@ mod tests {
     #[tokio::test]
     async fn test_wire_response_has_correct_fields() {
         let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            &session_id,
+        )
+        .await;
         let resp = post_mcp_with_session(
             app,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sequentialthinking","arguments":{"thought":"check","thoughtNumber":1,"totalThoughts":1,"nextThoughtNeeded":false}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sequentialthinking","arguments":{"thought":"check","thoughtNumber":1,"totalThoughts":1,"nextThoughtNeeded":false}}}"#,
             &session_id,
         )
         .await;
@@ -1969,14 +2022,33 @@ mod tests {
 
     #[test]
     fn test_tools_list_base_tools() {
-        // No prefix, no role → 3 base tools (sequentialthinking + temper + configure)
+        // No prefix, no role → 2 base tools (temper + configure)
         let result = handle_tools_list(false, false, false, json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 2);
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"sequentialthinking"));
+        assert!(!names.contains(&"sequentialthinking"));
         assert!(names.contains(&"temper"));
         assert!(names.contains(&"configure"));
+    }
+
+    #[test]
+    fn test_tools_list_before_temper_no_sequentialthinking() {
+        // No role → sequentialthinking absent, count is 2
+        let result = handle_tools_list(false, false, false, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(!names.contains(&"sequentialthinking"));
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn test_tools_list_after_temper_has_sequentialthinking() {
+        // has_role=true → sequentialthinking present
+        let result = handle_tools_list(true, true, false, json!(1));
+        let tools = result["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"sequentialthinking"));
     }
 
     #[tokio::test]
@@ -2019,6 +2091,48 @@ mod tests {
         assert!(names.contains(&"submit"));
         assert!(names.contains(&"fetch"));
         assert!(names.contains(&"judge"));
+    }
+
+    #[tokio::test]
+    async fn test_sequentialthinking_uses_session_mode() {
+        // After temper(build), sequentialthinking uses session's thinking_mode (no thinkingMode in args)
+        let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            &session_id,
+        )
+        .await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sequentialthinking","arguments":{"thought":"test","thoughtNumber":1,"totalThoughts":1,"nextThoughtNeeded":false}}}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        assert!(!body["result"]["isError"].as_bool().unwrap_or(true));
+    }
+
+    #[tokio::test]
+    async fn test_sequentialthinking_ignores_client_mode() {
+        // After temper(build), thinkingMode in args is deserialized but overwritten by session mode
+        let (app, session_id) = initialized_app().await;
+        post_mcp_with_session(
+            app.clone(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
+            &session_id,
+        )
+        .await;
+        let resp = post_mcp_with_session(
+            app,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sequentialthinking","arguments":{"thought":"test","thoughtNumber":1,"totalThoughts":1,"nextThoughtNeeded":false,"thinkingMode":"architecture"}}}"#,
+            &session_id,
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(body.get("error").is_none(), "unexpected error: {:?}", body);
+        assert!(!body["result"]["isError"].as_bool().unwrap_or(true));
     }
 
     #[tokio::test]
