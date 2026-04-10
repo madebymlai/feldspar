@@ -158,6 +158,83 @@ pub fn generate_prefix() -> String {
         .collect()
 }
 
+/// Build the per-role tool documentation block embedded in the temper response.
+/// Describes ONLY the tools the role should actually use — the MCP tools/list
+/// exposes everything, but this is how the agent learns which tools apply and
+/// what shape to pass.
+fn tools_section(agent: &AgentDef) -> String {
+    let mut out = String::new();
+
+    // Orchestrator delegates only — no artifact access, no thinking tool.
+    if agent.name == "orchestrator" {
+        return out;
+    }
+
+    out.push_str("- `sequentialthinking`: Work through problems step by step. Always available.\n");
+
+    // Build role has no typed artifact (code is tracked via file changes).
+    // Other ar_gated roles fetch upstream artifacts via their `fetches` list
+    // and submit their own typed artifact.
+    let artifact_type = agent.artifact_type.as_str();
+    let (unit_name, unit_shape) = match artifact_type {
+        "brief" => ("requirement", Some(
+            "  - name: string (short identifier)\n  \
+             - description: string (full description)\n  \
+             - user_story: string (\"as a user I want...\")"
+        )),
+        "design" => ("module", Some(
+            "  - name: string (module name)\n  \
+             - purpose: string (what this module does)\n  \
+             - leverages: string[] (existing code/libs this reuses)\n  \
+             - description: string (details)"
+        )),
+        "execution_plan" => ("task", Some(
+            "  - number: integer (task number, 1-indexed)\n  \
+             - name: string (task title)\n  \
+             - group: string (two-digit group id, e.g. \"01\")\n  \
+             - depends_on: integer[] (task numbers this depends on)\n  \
+             - leverages: string[] (existing code/libs this reuses)\n  \
+             - description: string (what to build)"
+        )),
+        "diagnosis" => ("diagnosis", Some(
+            "  - problem: string (what's broken)\n  \
+             - root_cause: string (why it happens)\n  \
+             - fix: string (the change to make)\n  \
+             - files: string[] (files affected)"
+        )),
+        "validation_report" => ("claim", Some(
+            "  - number: integer (claim number, 1-indexed)\n  \
+             - text: string (the claim)\n  \
+             - verdict: string (\"match\"/\"mismatch\"/\"unclear\")\n  \
+             - evidence: string (supporting quotes or reasoning)"
+        )),
+        _ => (artifact_type, None),
+    };
+
+    if let Some(shape) = unit_shape {
+        out.push_str(&format!(
+            "- `submit`: Add a new {unit_name} to your artifact. Shape:\n{shape}\n"
+        ));
+        out.push_str(&format!(
+            "- `revise`: Replace an existing {unit_name} by name. Same shape as submit.\n"
+        ));
+        out.push_str(&format!(
+            "- `remove`: Remove a {unit_name} by name (or number for validation_report).\n"
+        ));
+    }
+
+    // Fetch is available to anyone who isn't the orchestrator.
+    out.push_str("- `fetch`: Read a previously submitted artifact. Args: {prefix, type}.\n");
+
+    if agent.ar_gated {
+        out.push_str("- `judge`: Get a verdict on your artifact (approve/revise). Call after submit.\n");
+    }
+
+    out.push_str("- `configure`: Manage principles and modes. Rarely used at runtime.\n");
+
+    out
+}
+
 pub fn temper(agent: &AgentDef, config: &Config, prefix: &str) -> String {
     let mut output = String::new();
 
@@ -203,6 +280,12 @@ pub fn temper(agent: &AgentDef, config: &Config, prefix: &str) -> String {
     if agent.name != "orchestrator" {
         output.push_str("## Shutdown Protocol\n\n");
         output.push_str(SHUTDOWN_PROTOCOL);
+    }
+
+    let tools_doc = tools_section(agent);
+    if !tools_doc.is_empty() {
+        output.push_str("\n\n## Available Tools\n\n");
+        output.push_str(&tools_doc);
     }
 
     if agent.ar_gated {

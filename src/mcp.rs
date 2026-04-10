@@ -433,16 +433,7 @@ async fn dispatch_message(
             let (response, session_id) = handle_initialize(state, id, params).await;
             DispatchResult::Response(response, Some(session_id))
         }
-        "tools/list" => {
-            let (has_prefix, has_role, is_ar_gated, artifact_type) = if let Ok(sid) = validate_session(state, headers).await {
-                state.sessions.read().await.get(&sid)
-                    .map(|s| (s.prefix.is_some(), s.role.is_some(), s.ar_gated, s.artifact_type.clone()))
-                    .unwrap_or((false, false, false, None))
-            } else {
-                (false, false, false, None)
-            };
-            DispatchResult::Response(handle_tools_list(has_prefix, has_role, is_ar_gated, artifact_type.as_deref(), id), None)
-        }
+        "tools/list" => DispatchResult::Response(handle_tools_list(id), None),
         "tools/call" => DispatchResult::Response(handle_tools_call(state, headers, id, params).await, None),
         "ping" => DispatchResult::Response(jsonrpc_result(id, json!({})), None),
         _ => DispatchResult::Response(
@@ -589,30 +580,42 @@ fn sequentialthinking_tool_def() -> Value {
     })
 }
 
-fn submit_tool_def(artifact_type: &str) -> Value {
-    let (unit_name, schema) = unit_schema_for(artifact_type);
+fn submit_tool_def() -> Value {
     json!({
         "name": "submit",
-        "description": format!("Add a new {} to the artifact. Errors if name already exists.", unit_name),
-        "inputSchema": schema
+        "description": "REQUIRES `temper` first. Add a new unit to your assigned artifact. The exact field shape depends on your role (brief → requirement, design → module, execution_plan → task, diagnosis → diagnosis). See your temper response for required fields. Errors if name already exists.",
+        "inputSchema": {
+            "type": "object",
+            "description": "Role-specific fields — see temper response for shape.",
+            "additionalProperties": true
+        }
     })
 }
 
-fn revise_tool_def(artifact_type: &str) -> Value {
-    let (unit_name, schema) = unit_schema_for(artifact_type);
+fn revise_tool_def() -> Value {
     json!({
         "name": "revise",
-        "description": format!("Replace an existing {} by name. Errors if name doesn't exist.", unit_name),
-        "inputSchema": schema
+        "description": "REQUIRES `temper` first. Replace an existing unit in your artifact by name. Same shape as submit. Errors if name doesn't exist.",
+        "inputSchema": {
+            "type": "object",
+            "description": "Role-specific fields — see temper response for shape.",
+            "additionalProperties": true
+        }
     })
 }
 
-fn remove_tool_def(artifact_type: &str) -> Value {
-    let (unit_name, key_schema) = unit_key_for(artifact_type);
+fn remove_tool_def() -> Value {
     json!({
         "name": "remove",
-        "description": format!("Remove a {} by name.", unit_name),
-        "inputSchema": key_schema
+        "description": "REQUIRES `temper` first. Remove a unit from your artifact by name (or number for validation_report).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Unit name (brief/design/execution_plan)" },
+                "number": { "type": "integer", "description": "Claim number (validation_report only)" }
+            },
+            "additionalProperties": false
+        }
     })
 }
 
@@ -1124,26 +1127,17 @@ fn configure_remove_mode(id: Value, arguments: &Value, config_dir: &std::path::P
     ok_response(id, &format!("Mode '{}' removed", name))
 }
 
-fn handle_tools_list(has_prefix: bool, has_role: bool, is_ar_gated: bool, artifact_type: Option<&str>, id: Value) -> Value {
-    let mut tools = vec![];
-    if !has_role {
-        tools.push(temper_tool_def());
-    }
-    tools.push(configure_tool_def());
-    if has_role {
-        tools.push(sequentialthinking_tool_def());
-    }
-    if let (true, Some(at)) = (has_prefix, artifact_type) {
-        if artifact_type_to_mode(at).is_some() {
-            tools.push(submit_tool_def(at));
-            tools.push(revise_tool_def(at));
-            tools.push(remove_tool_def(at));
-        }
-        tools.push(fetch_tool_def());
-        if is_ar_gated {
-            tools.push(judge_tool_def());
-        }
-    }
+fn handle_tools_list(id: Value) -> Value {
+    let tools = vec![
+        temper_tool_def(),
+        configure_tool_def(),
+        sequentialthinking_tool_def(),
+        submit_tool_def(),
+        revise_tool_def(),
+        remove_tool_def(),
+        fetch_tool_def(),
+        judge_tool_def(),
+    ];
     jsonrpc_result(id, json!({ "tools": tools }))
 }
 
@@ -2048,48 +2042,16 @@ mod tests {
     }
 
     #[test]
-    fn test_tools_list_no_prefix() {
-        // No prefix, no role → temper + configure, no sequentialthinking/submit/revise/remove/fetch/judge
-        let result = handle_tools_list(false, false, false, None, json!(1));
+    fn test_tools_list_returns_all_tools() {
+        // tools/list always returns the full flat list. Per-role tool selection
+        // is communicated via the temper response prompt, not via schema gating.
+        let result = handle_tools_list(json!(1));
         let tools = result["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"sequentialthinking"));
-        assert!(names.contains(&"temper"));
-        assert!(names.contains(&"configure"));
-        assert!(!names.contains(&"submit"));
-        assert!(!names.contains(&"revise"));
-        assert!(!names.contains(&"remove"));
-        assert!(!names.contains(&"fetch"));
-        assert!(!names.contains(&"judge"));
-    }
-
-    #[test]
-    fn test_tools_list_with_prefix_ar_gated() {
-        // has_prefix=true, ar_gated=true, no role → temper + configure + submit + revise + remove + fetch + judge
-        let result = handle_tools_list(true, false, true, Some("brief"), json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"sequentialthinking"));
-        assert!(names.contains(&"temper"));
-        assert!(names.contains(&"configure"));
-        assert!(names.contains(&"submit"));
-        assert!(names.contains(&"revise"));
-        assert!(names.contains(&"remove"));
-        assert!(names.contains(&"fetch"));
-        assert!(names.contains(&"judge"));
-    }
-
-    #[test]
-    fn test_tools_list_with_prefix_not_ar_gated() {
-        // has_prefix=true, ar_gated=false → submit + revise + remove + fetch, no judge
-        let result = handle_tools_list(true, false, false, Some("brief"), json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"submit"));
-        assert!(names.contains(&"revise"));
-        assert!(names.contains(&"remove"));
-        assert!(names.contains(&"fetch"));
-        assert!(!names.contains(&"judge"));
+        for expected in &["temper", "configure", "sequentialthinking", "submit", "revise", "remove", "fetch", "judge"] {
+            assert!(names.contains(expected), "missing tool: {}", expected);
+        }
+        assert_eq!(names.len(), 8);
     }
 
     #[tokio::test]
@@ -2392,37 +2354,6 @@ mod tests {
 
     // --- AR tools tests ---
 
-    #[test]
-    fn test_tools_list_base_tools() {
-        // No prefix, no role → 2 base tools (temper + configure)
-        let result = handle_tools_list(false, false, false, None, json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2);
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"sequentialthinking"));
-        assert!(names.contains(&"temper"));
-        assert!(names.contains(&"configure"));
-    }
-
-    #[test]
-    fn test_tools_list_before_temper_no_sequentialthinking() {
-        // No role → sequentialthinking absent, count is 2
-        let result = handle_tools_list(false, false, false, None, json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"sequentialthinking"));
-        assert_eq!(tools.len(), 2);
-    }
-
-    #[test]
-    fn test_tools_list_after_temper_has_sequentialthinking() {
-        // has_role=true → sequentialthinking present
-        let result = handle_tools_list(true, true, false, None, json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"sequentialthinking"));
-    }
-
     #[tokio::test]
     async fn test_temper_sets_prefix_in_session() {
         let (app, session_id) = initialized_app().await;
@@ -2439,32 +2370,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tools_list_after_temper_shows_all() {
-        // After temper(build) → temper hidden, 4 tools: configure + sequentialthinking + fetch + judge
-        // (build has artifact_type=code which has no typed schema, so submit/revise/remove absent)
+    async fn test_tools_list_always_full_flat_set() {
+        // Client discovery is one-shot (Claude Code only calls tools/list once).
+        // The server returns the full flat tool set regardless of session state.
+        // Per-role tool applicability is communicated via the temper response.
         let (app, session_id) = initialized_app().await;
-        post_mcp_with_session(
-            app.clone(),
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
-            &session_id,
-        )
-        .await;
         let resp = post_mcp_with_session(
             app,
             r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
             &session_id,
-        )
-        .await;
+        ).await;
         let body = body_json(resp).await;
         let tools = body["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"temper"));
-        assert!(names.contains(&"configure"));
-        assert!(names.contains(&"sequentialthinking"));
-        assert!(!names.contains(&"submit"));
-        assert!(names.contains(&"fetch"));
-        assert!(names.contains(&"judge"));
+        assert_eq!(tools.len(), 8, "expected 8 tools, got: {:?}", names);
+        for expected in &["temper", "configure", "sequentialthinking", "submit", "revise", "remove", "fetch", "judge"] {
+            assert!(names.contains(expected), "missing tool: {}", expected);
+        }
     }
 
     #[tokio::test]
@@ -2824,28 +2746,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_submit_build_skips_typed_tools() {
+    async fn test_build_temper_omits_submit_in_prompt() {
+        // Build has artifact_type="code" — no typed submit/revise/remove.
+        // The temper prompt should not document submit/revise/remove but
+        // should document fetch and judge.
         let (app, session_id) = initialized_app().await;
-        // build has artifact_type=code → submit returns "No artifact type set" because code is not in toml_key_for
-        // Actually build does set artifact_type="code" but toml_key_for("code") panics → use submit without temper
-        // Instead verify build session does NOT show submit in tools/list
-        post_mcp_with_session(
-            app.clone(),
+        let resp = post_mcp_with_session(
+            app,
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
             &session_id,
         ).await;
-        let resp = post_mcp_with_session(
-            app,
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
-            &session_id,
-        ).await;
         let body = body_json(resp).await;
-        let tools = body["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"submit"), "build agent should not expose typed submit");
-        assert!(!names.contains(&"revise"), "build agent should not expose revise");
-        assert!(!names.contains(&"remove"), "build agent should not expose remove");
-        assert!(names.contains(&"fetch"), "build agent should still have fetch");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("## Available Tools"));
+        // Isolate the Available Tools section up to the next section header.
+        let after_header = text.split("## Available Tools").nth(1).unwrap_or("");
+        let tools_block = after_header.split("\n## ").next().unwrap_or(after_header);
+        assert!(!tools_block.contains("`submit`"), "build must not document submit");
+        assert!(!tools_block.contains("`revise`"), "build must not document revise");
+        assert!(!tools_block.contains("`remove`"), "build must not document remove");
+        assert!(tools_block.contains("`fetch`"), "build must document fetch. block: {}", tools_block);
+        assert!(tools_block.contains("`judge`"), "build is ar_gated so must document judge");
     }
 
     // --- Temper prefix tests (Task 2) ---
@@ -2893,24 +2814,6 @@ mod tests {
         let first_line = text.lines().next().unwrap();
         let generated = first_line.strip_prefix("PREFIX: ").unwrap();
         assert_eq!(generated.len(), 4, "empty prefix should generate new 4-char prefix");
-    }
-
-    // --- Tools list: teammate has fetch (Task 4) ---
-
-    #[test]
-    fn test_tools_list_with_prefix_has_fetch() {
-        let result = handle_tools_list(true, false, false, Some("brief"), json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"fetch"), "fetch not in tempered session tools");
-    }
-
-    #[test]
-    fn test_tools_list_no_prefix_no_fetch() {
-        let result = handle_tools_list(false, false, false, None, json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"fetch"), "fetch must not appear without prefix");
     }
 
     // --- Fetch tool tests (Task 3) ---
@@ -3124,26 +3027,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tools_list_hides_temper_after_use() {
-        let (app, session_id) = initialized_app().await;
-        post_mcp_with_session(
-            app.clone(),
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"build","group":"01"}}}"#,
-            &session_id,
-        ).await;
-        let resp = post_mcp_with_session(
-            app,
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
-            &session_id,
-        ).await;
-        let body = body_json(resp).await;
-        let names: Vec<_> = body["result"]["tools"].as_array().unwrap()
-            .iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"temper"), "temper must be hidden after temper call");
-    }
-
-    #[tokio::test]
-    async fn test_tools_list_shows_temper_before_use() {
+    async fn test_tools_list_shows_temper_always() {
+        // temper is always in tools/list (including after being called) —
+        // dynamic hiding doesn't work with one-shot discovery clients.
         let (app, session_id) = initialized_app().await;
         let resp = post_mcp_with_session(
             app,
@@ -3153,7 +3039,7 @@ mod tests {
         let body = body_json(resp).await;
         let names: Vec<_> = body["result"]["tools"].as_array().unwrap()
             .iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"temper"), "temper must be visible before temper call");
+        assert!(names.contains(&"temper"));
     }
 
     // --- Task 3 tests: GET /session/:id ---
@@ -3351,17 +3237,6 @@ mod tests {
         assert!(body.get("error").is_none(), "temper error: {:?}", body);
         let text = body["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("build agent"), "expected agent prompt: {}", text);
-
-        // tools/list must not include temper
-        let resp = post_mcp_with_session(
-            app.clone(),
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
-            &session_id,
-        ).await;
-        let body = body_json(resp).await;
-        let names: Vec<_> = body["result"]["tools"].as_array().unwrap()
-            .iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"temper"), "temper must be hidden after call");
 
         // Change file must exist after temper
         let change_file = init::data_dir("test")
@@ -3596,24 +3471,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_temper_disappears_for_all_roles() {
-        let (app, session_id) = initialized_app().await;
-        post_mcp_with_session(
-            app.clone(),
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"temper","arguments":{"role":"solve"}}}"#,
-            &session_id,
-        ).await;
-        let resp = post_mcp_with_session(
-            app,
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#,
-            &session_id,
-        ).await;
-        let body = body_json(resp).await;
-        let names: Vec<_> = body["result"]["tools"].as_array().unwrap()
-            .iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"temper"), "temper must be hidden after temper call for solve role");
-    }
 
     #[test]
     fn test_triple_quote_escaping_in_toml() {
@@ -3709,61 +3566,20 @@ mod tests {
         assert_eq!(find_unit_index(&arr, "name", &toml::Value::String("y".into())), None);
     }
 
-    #[test]
-    fn test_submit_tool_def_brief_schema() {
-        let tool = submit_tool_def("brief");
-        let props = &tool["inputSchema"]["properties"];
-        assert!(props["name"].is_object(), "brief schema must have name");
-        assert!(props["description"].is_object(), "brief schema must have description");
-        assert!(props["user_story"].is_object(), "brief schema must have user_story");
-    }
-
-    #[test]
-    fn test_remove_tool_def_claim_schema() {
-        let tool = remove_tool_def("validation_report");
-        let props = &tool["inputSchema"]["properties"];
-        assert!(props["number"].is_object(), "claim remove schema must have number");
-        assert!(props.as_object().map(|m| m.len() == 1).unwrap_or(false), "only number property");
-    }
-
-    #[test]
-    fn test_tools_list_includes_revise_remove() {
-        let result = handle_tools_list(true, false, false, Some("brief"), json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"submit"));
-        assert!(names.contains(&"revise"));
-        assert!(names.contains(&"remove"));
-    }
-
-    #[test]
-    fn test_tools_list_no_prefix_no_submit_revise_remove() {
-        let result = handle_tools_list(false, false, false, None, json!(1));
-        let tools = result["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"submit"));
-        assert!(!names.contains(&"revise"));
-        assert!(!names.contains(&"remove"));
-    }
-
     #[tokio::test]
-    async fn test_temper_sets_artifact_type() {
+    async fn test_temper_response_documents_submit_shape_for_arm() {
         let (app, session_id) = initialized_app().await;
-        post_mcp_with_session(
-            app.clone(),
+        let resp = post_mcp_with_session(
+            app,
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"temper","arguments":{"role":"arm"}}}"#,
             &session_id,
         ).await;
-        // arm has artifact_type=brief → submit schema shows requirement fields
-        let resp = post_mcp_with_session(
-            app,
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
-            &session_id,
-        ).await;
         let body = body_json(resp).await;
-        let tools = body["result"]["tools"].as_array().unwrap();
-        let submit = tools.iter().find(|t| t["name"] == "submit").expect("submit must be present for arm");
-        assert!(submit["inputSchema"]["properties"]["user_story"].is_object());
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        // arm → brief → submit shape documented in the temper prompt
+        assert!(text.contains("## Available Tools"), "temper must include tools section");
+        assert!(text.contains("submit"));
+        assert!(text.contains("user_story"), "arm temper must document brief unit shape");
     }
 
     #[tokio::test]
