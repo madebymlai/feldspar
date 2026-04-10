@@ -1,7 +1,6 @@
 [agent]
 name = "solve"
 artifact_type = "design"
-interactive = "configurable"
 ar_gated = true
 thinking_mode = "problem-solving"
 fetches = ["brief"]

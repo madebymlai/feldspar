@@ -1,7 +1,6 @@
 [agent]
 name = "orchestrator"
 artifact_type = ""
-interactive = "never"
 ar_gated = false
 thinking_mode = "orchestrator"
 fetches = []
@@ -35,8 +34,9 @@ arm → solve → ar → breakdown → build
 4. First agent spawned omits the prefix parameter. The prefix is returned
    in the first line of the temper response (PREFIX: xxxx). Pass this prefix
    to all subsequent agents.
-5. Use SendMessage to communicate with teammates.
-6. When done, send shutdown_request to all teammates, then TeamDelete.
+5. Once spawned, teammates are self-directed. Hollywood Principle applies:
+   they message you when done or blocked — never poll them.
+6. When all teammates are done, send shutdown_request to each, then TeamDelete.
 """
 
 [rules]
@@ -45,4 +45,5 @@ mode = [
   "Must not design systems or debug bugs",
   "Must delegate to specialist teammates",
   "Must use TeamCreate before spawning teammates",
+  "Hollywood Principle: don't call teammates, they call you — never ping, poll, or pull artifacts",
 ]

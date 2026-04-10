@@ -1,7 +1,6 @@
 [agent]
 name = "bugfest"
 artifact_type = "diagnosis"
-interactive = "configurable"
 ar_gated = true
 thinking_mode = "debugging"
 fetches = []

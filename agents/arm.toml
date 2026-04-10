@@ -1,7 +1,6 @@
 [agent]
 name = "arm"
 artifact_type = "brief"
-interactive = "always"
 ar_gated = false
 thinking_mode = "brainstorming"
 fetches = []

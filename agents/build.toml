@@ -1,7 +1,6 @@
 [agent]
 name = "build"
 artifact_type = "code"
-interactive = "never"
 ar_gated = true
 thinking_mode = "implementation"
 fetches = ["execution_plan"]

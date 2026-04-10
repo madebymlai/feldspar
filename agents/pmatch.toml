@@ -1,7 +1,6 @@
 [agent]
 name = "pmatch"
 artifact_type = "validation_report"
-interactive = "never"
 ar_gated = false
 thinking_mode = "pattern-matching"
 fetches = []

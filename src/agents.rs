@@ -38,7 +38,6 @@ struct RawAgentToml {
 struct RawAgentSection {
     name: String,
     artifact_type: String,
-    interactive: String, // "always" | "never" | "configurable"
     ar_gated: bool,
     thinking_mode: String,
     #[serde(default)]
@@ -67,7 +66,6 @@ struct RawRulesSection {
 pub struct AgentDef {
     pub name: String,
     pub artifact_type: String,
-    pub interactive: String,
     pub ar_gated: bool,
     pub thinking_mode: String,
     pub identity: String,
@@ -81,7 +79,6 @@ fn parse_agent_def(raw: RawAgentToml) -> AgentDef {
     AgentDef {
         name: raw.agent.name.clone(),
         artifact_type: raw.agent.artifact_type,
-        interactive: raw.agent.interactive,
         ar_gated: raw.agent.ar_gated,
         thinking_mode: raw.agent.thinking_mode,
         identity: raw.prompt.identity.trim().to_owned(),
@@ -169,10 +166,10 @@ pub fn temper(agent: &AgentDef, config: &Config, prefix: &str) -> String {
     output.push_str(&agent.identity);
     output.push_str("\n\n");
 
-    let instructions = match agent.interactive.as_str() {
-        "always" | "configurable" => agent.interactive_instructions.as_deref(),
-        _ => agent.autonomous_instructions.as_deref(),
-    };
+    let instructions = agent
+        .interactive_instructions
+        .as_deref()
+        .or(agent.autonomous_instructions.as_deref());
     if let Some(instr) = instructions {
         output.push_str(instr);
         output.push_str("\n\n");
@@ -203,8 +200,10 @@ pub fn temper(agent: &AgentDef, config: &Config, prefix: &str) -> String {
         output.push('\n');
     }
 
-    output.push_str("## Shutdown Protocol\n\n");
-    output.push_str(SHUTDOWN_PROTOCOL);
+    if agent.name != "orchestrator" {
+        output.push_str("## Shutdown Protocol\n\n");
+        output.push_str(SHUTDOWN_PROTOCOL);
+    }
 
     if agent.ar_gated {
         output.push_str("\n\n## Artifact Protocol\n\n");
@@ -426,6 +425,15 @@ mod tests {
     }
 
     #[test]
+    fn test_temper_orchestrator_no_shutdown() {
+        let agents = load_agents("test");
+        let agent = agents.get("orchestrator").unwrap();
+        let config = test_config_empty_principles();
+        let output = temper(agent, &config, "test");
+        assert!(!output.contains("## Shutdown Protocol"), "orchestrator must not have shutdown protocol");
+    }
+
+    #[test]
     fn test_temper_empty_principles() {
         let agents = load_agents("test");
         let agent = agents.get("build").unwrap();
@@ -472,7 +480,6 @@ mod tests {
 [agent]
 name = "custom-test"
 artifact_type = "code"
-interactive = "never"
 ar_gated = false
 thinking_mode = "custom"
 
@@ -502,7 +509,6 @@ mode = []
 [agent]
 name = "build"
 artifact_type = "docs"
-interactive = "never"
 ar_gated = false
 thinking_mode = "custom-build"
 
